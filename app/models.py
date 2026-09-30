@@ -22,7 +22,15 @@ class User(Base):
     initial_weight_kg: Mapped[float] = mapped_column(Float)
     current_weight_kg: Mapped[float] = mapped_column(Float)
     target_weight_kg: Mapped[float | None] = mapped_column(Float, nullable=True)
-    activity_level: Mapped[str] = mapped_column(String(32))
+
+    # Legacy column kept temporarily so existing SQLite/PostgreSQL databases can
+    # be upgraded without a destructive table rebuild. New calculations ignore it.
+    activity_level: Mapped[str] = mapped_column(String(32), default="legacy")
+
+    usual_km: Mapped[float] = mapped_column(Float, default=0.0)
+    tdee_correction: Mapped[float] = mapped_column(Float, default=0.0)
+    last_tdee_recalc_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
     goal: Mapped[str] = mapped_column(String(16))
     maintenance_calories: Mapped[int] = mapped_column(Integer)
     calorie_target: Mapped[int] = mapped_column(Integer)
@@ -75,6 +83,13 @@ class ActivityEntry(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     activity_date: Mapped[date] = mapped_column(Date, index=True)
+
+    km_walked: Mapped[float | None] = mapped_column(Float, nullable=True)
+    terrain: Mapped[str] = mapped_column(String(16), default="flat")
+    pace: Mapped[str] = mapped_column(String(16), default="normal")
+    workout_kcal: Mapped[float] = mapped_column(Float, default=0.0)
+
+    # Legacy fields are retained for non-destructive migration only.
     steps: Mapped[int] = mapped_column(Integer, default=0)
     workout_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
     workout_minutes: Mapped[int] = mapped_column(Integer, default=0)
