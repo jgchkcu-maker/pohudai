@@ -196,7 +196,6 @@ def calculate_targets(user, daily_log: DailyLog | None = None) -> Targets:
 
     maintenance = a / (1.0 - TEF_RATE)
     if goal == "lose":
-        calories = ADULT_LOSS_RATE
         calories = (1.0 - ADULT_LOSS_RATE) * a / (1.0 - (1.0 - ADULT_LOSS_RATE) * TEF_RATE)
         calories = max(calories, rmr_v * 1.10)
     elif goal == "gain":
