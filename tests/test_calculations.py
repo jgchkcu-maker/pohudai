@@ -9,13 +9,16 @@ from app.calculations import (
     ee_walk,
     mifflin_st_jeor,
     recalc_from_history,
+    teen_ree_molnar,
 )
+from app.cdc_bmi import teen_bmi_status
 
 
 def user(**overrides):
     data = {
         "sex": "male",
         "age": 30,
+        "birth_date": None,
         "height_cm": 180.0,
         "current_weight_kg": 80.0,
         "target_weight_kg": 72.0,
@@ -56,19 +59,63 @@ def test_adult_loss_target_is_below_maintenance():
     assert t.method == "MIFFLIN_V3_1"
 
 
-def test_teen_gets_small_automatic_deficit():
-    teen = user(age=16, goal="lose", current_weight_kg=80.0, usual_km=5.0)
+def test_molnar_is_converted_from_kj_to_kcal():
+    teen = user(age=16, current_weight_kg=112.8, height_cm=185.0)
+    assert teen_ree_molnar(teen) == pytest.approx(2305.0, abs=1.0)
+
+
+def test_teen_nikita_case_is_not_dri_3600():
+    teen = user(
+        age=16,
+        birth_date=None,
+        goal="lose",
+        current_weight_kg=112.8,
+        height_cm=185.0,
+        usual_km=2.0,
+        target_weight_kg=None,
+    )
     t = calculate_targets(teen)
     assert t.is_youth
-    assert 0 < t.deficit_kcal <= 200
-    assert t.calories < t.maintenance
-    assert t.method == "DRI_EER_2023_TEEN"
+    assert t.method == "MOLNAR_CDC_TEEN_V3_2"
+    assert 2850 <= t.maintenance <= 2950
+    assert 2600 <= t.calories <= 2750
+    assert 150 <= t.deficit_kcal <= 250
+    assert t.bmi_category == "obesity"
+
+
+def test_teen_below_obesity_gets_no_automatic_loss_deficit():
+    teen = user(
+        age=16,
+        birth_date=None,
+        goal="lose",
+        current_weight_kg=80.0,
+        height_cm=185.0,
+        usual_km=2.0,
+        target_weight_kg=None,
+    )
+    t = calculate_targets(teen)
+    assert t.is_youth
+    assert t.deficit_kcal == 0
+    assert t.calories == t.maintenance
+
+
+def test_cdc_bmi_for_age_uses_sex_and_month():
+    status = teen_bmi_status(
+        sex="male",
+        birth_date=date(2010, 1, 1),
+        height_cm=185.0,
+        weight_kg=112.8,
+        on_date=date(2026, 1, 1),
+    )
+    assert status is not None
+    assert status.age_months == 192
+    assert status.p95 == pytest.approx(27.5639)
+    assert status.category == "obesity"
 
 
 def test_recalc_sign_and_clamp():
     u = user(usual_km=5.0)
     start = datetime(2026, 1, 1)
-    # Six measurements spanning 14 days with a clear downward trend.
     weights = [
         SimpleNamespace(measured_at=start + timedelta(days=d), weight_kg=80.0 - 0.04 * d)
         for d in [0, 3, 6, 9, 12, 14]
