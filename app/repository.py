@@ -31,6 +31,7 @@ async def create_user(session: AsyncSession, tg_id: int, name: str | None, data:
     profile = SimpleNamespace(
         sex=data["sex"],
         age=data["age"],
+        birth_date=data.get("birth_date"),
         height_cm=data["height_cm"],
         current_weight_kg=data["weight_kg"],
         target_weight_kg=data.get("target_weight_kg"),
@@ -44,6 +45,7 @@ async def create_user(session: AsyncSession, tg_id: int, name: str | None, data:
         name=name,
         sex=data["sex"],
         age=data["age"],
+        birth_date=data.get("birth_date"),
         height_cm=data["height_cm"],
         initial_weight_kg=data["weight_kg"],
         current_weight_kg=data["weight_kg"],

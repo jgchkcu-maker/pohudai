@@ -49,6 +49,7 @@ router = Router(name="pohudai")
 
 class Onboarding(StatesGroup):
     age = State()
+    birth_date = State()
     height = State()
     weight = State()
     target_weight = State()
@@ -224,7 +225,31 @@ async def onboarding_age(message: Message, state: FSMContext) -> None:
     if not value or not 14 <= value <= 100:
         await message.answer("Введи возраст числом, например: 27")
         return
-    await state.update_data(age=int(value))
+    age = int(value)
+    await state.update_data(age=age)
+    if age < 18:
+        await state.set_state(Onboarding.birth_date)
+        await message.answer("Напиши дату рождения в формате <b>ДД.ММ.ГГГГ</b>.\nОна нужна, чтобы считать BMI-for-age по точному возрасту.")
+        return
+    await state.set_state(Onboarding.height)
+    await message.answer("Какой у тебя рост? Например: <b>182 см</b>")
+
+
+@router.message(Onboarding.birth_date)
+async def onboarding_birth_date(message: Message, state: FSMContext) -> None:
+    try:
+        born = datetime.strptime((message.text or "").strip(), "%d.%m.%Y").date()
+    except ValueError:
+        await message.answer("Не понял дату. Напиши, например: <b>14.03.2010</b>")
+        return
+
+    today = date.today()
+    age = today.year - born.year - ((today.month, today.day) < (born.month, born.day))
+    if not 14 <= age < 18:
+        await message.answer("По этой дате возраст не попадает в диапазон 14–17 лет. Проверь дату рождения.")
+        return
+
+    await state.update_data(age=age, birth_date=born)
     await state.set_state(Onboarding.height)
     await message.answer("Какой у тебя рост? Например: <b>182 см</b>")
 
@@ -254,12 +279,15 @@ async def onboarding_weight(message: Message, state: FSMContext) -> None:
 async def onboarding_goal(callback: CallbackQuery, state: FSMContext) -> None:
     goal = callback.data.split(":", 1)[1]
     await state.update_data(goal=goal)
-    if goal == "lose":
-        data = await state.get_data()
+    data = await state.get_data()
+    if goal == "lose" and data.get("age", 18) >= 18:
         await state.set_state(Onboarding.target_weight)
         await callback.message.edit_text(f"Сейчас: {data['weight_kg']:.1f} кг\nДо какого веса хочешь похудеть?")
         await callback.answer()
         return
+    # For teens the exact goal weight does not control the deficit: height is
+    # still changing, so the engine follows BMI-for-age and the weight trend.
+    await state.update_data(target_weight_kg=None)
     await state.set_state(Onboarding.usual_km)
     await callback.message.edit_text("Сколько км ты примерно проходишь в обычный день?\nНапример: <b>5</b>")
     await callback.answer()
@@ -292,23 +320,33 @@ async def _finish_onboarding(message: Message, tg_id: int, name: str | None, sta
     async with SessionLocal() as session:
         user = await create_user(session, tg_id, name, data)
     await state.clear()
+    targets = calculate_targets(user, DailyLog(km_walked=user.usual_km))
     target = f"\nЦель по весу: {user.target_weight_kg:.1f} кг" if user.target_weight_kg else ""
-    deficit = max(0, user.maintenance_calories - user.calorie_target)
-    method = "DRI EER 2023 (подростковая модель)" if user.age < 18 else "Mifflin-St Jeor v3.1"
-    youth_note = (
-        "\n<i>Для пользователей младше 18 лет дефицит специально мягче взрослого: 5%, максимум 200 ккал/день.</i>"
-        if user.age < 18 and user.goal == "lose"
-        else ""
-    )
+    method = "Molnár + CDC BMI-for-age" if user.age < 18 else "Mifflin-St Jeor v3.1"
+    if user.age < 18:
+        if targets.deficit_kcal > 0:
+            youth_note = (
+                f"\n<i>Автоматический дефицит: ~{targets.deficit_kcal} ккал/день. "
+                "Точный вес-цель не задаёт скорость похудения: её ограничивает подростковый режим.</i>"
+            )
+        else:
+            youth_note = (
+                "\n<i>Автоматический дефицит сейчас не назначен по BMI-for-age; "
+                "ориентир используется как поддержание.</i>"
+            )
+    else:
+        youth_note = ""
+
     await message.answer(
         f"Готово ✅\n\nОценочная потребность для поддержания:\n"
         f"<b>{user.maintenance_calories} ккал/день</b>\n\n"
-        f"Дневная цель:\n<b>{user.calorie_target} ккал</b>\n"
+        f"Дневной ориентир:\n<b>{user.calorie_target} ккал</b>\n"
         f"Обычная ходьба: ~{user.usual_km:.1f} км/день\n"
         f"Белок: ~{user.protein_target_g} г/день{target}\n"
         f"Начальный вес: {user.initial_weight_kg:.1f} кг\n\n"
-        f"<i>Стартовый расчёт: {method}. Ориентировочный дефицит: ~{deficit} ккал/день.</i>"
-        f"{youth_note}",
+        f"<i>Стартовый расчёт: {method}.</i>"
+        f"{youth_note}\n"
+        + ("<i>Ориентир не означает, что калории нужно специально «доедать» до этой цифры.</i>" if user.age < 18 else ""),
         reply_markup=MAIN_MENU,
     )
 
@@ -454,10 +492,18 @@ async def food_save(callback: CallbackQuery, state: FSMContext) -> None:
         stats = await day_stats(session, user, food_day)
     await state.clear()
     remaining = user.calorie_target - stats["calories"]
-    await callback.message.edit_text(
-        f"Добавлено ✅\n\nСъедено: <b>{stats['calories']} / {user.calorie_target} ккал</b>\n"
-        f"Осталось: <b>{remaining} ккал</b>\nБелки: {stats['protein']} / {user.protein_target_g} г"
-    )
+    if user.age < 18:
+        await callback.message.edit_text(
+            f"Добавлено ✅\n\nСъедено: <b>{stats['calories']} ккал</b>\n"
+            f"Дневной ориентир: ~<b>{user.calorie_target} ккал</b>\n"
+            f"До ориентира: {remaining:+} ккал\nБелки: {stats['protein']} / {user.protein_target_g} г\n\n"
+            "<i>Это ориентир, а не обязательное количество, которое нужно добрать.</i>"
+        )
+    else:
+        await callback.message.edit_text(
+            f"Добавлено ✅\n\nСъедено: <b>{stats['calories']} / {user.calorie_target} ккал</b>\n"
+            f"Осталось: <b>{remaining} ккал</b>\nБелки: {stats['protein']} / {user.protein_target_g} г"
+        )
     await callback.message.answer("Что дальше?", reply_markup=MAIN_MENU)
     await callback.answer()
 
@@ -622,12 +668,14 @@ async def profile(message: Message) -> None:
         user = await get_user(session, message.from_user.id)
     if not user:
         return
-    target = f"{user.target_weight_kg:.1f} кг" if user.target_weight_kg else "не задана"
+    target = f"{user.target_weight_kg:.1f} кг" if user.target_weight_kg else "без фиксированного веса"
+    if user.age < 18:
+        target = "безопасная траектория по BMI-for-age"
     left = f"\nДо цели: {user.current_weight_kg - user.target_weight_kg:.1f} кг" if user.target_weight_kg else ""
     await message.answer(
         f"👤 <b>{user.name or 'Профиль'}</b>\n\nРост: {user.height_cm:.0f} см\nНачальный вес: {user.initial_weight_kg:.1f} кг\n"
         f"Текущий вес: {user.current_weight_kg:.1f} кг\nЦель: {target}\nПрогресс: {user.current_weight_kg - user.initial_weight_kg:+.1f} кг{left}\n\n"
-        + f"Дневная цель: {user.calorie_target} ккал\nОбычная ходьба: ~{user.usual_km:.1f} км/день",
+        + f"Дневной ориентир: {user.calorie_target} ккал\nОбычная ходьба: ~{user.usual_km:.1f} км/день",
         reply_markup=PROFILE_KB,
     )
 
@@ -656,12 +704,16 @@ async def profile_settings(callback: CallbackQuery) -> None:
         user = await get_user(session, callback.from_user.id)
     if not user:
         return
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    rows = [
         [InlineKeyboardButton(text=f"🎯 Калории: {user.calorie_target}", callback_data="settings:calories")],
-        [InlineKeyboardButton(text=f"⚖️ Цель веса: {user.target_weight_kg or '—'}", callback_data="settings:target_weight")],
+    ]
+    if user.age >= 18:
+        rows.append([InlineKeyboardButton(text=f"⚖️ Цель веса: {user.target_weight_kg or '—'}", callback_data="settings:target_weight")])
+    rows.extend([
         [InlineKeyboardButton(text=f"🌙 Вечерний опрос: {'вкл' if user.evening_poll_enabled else 'выкл'}", callback_data="settings:evening")],
         [InlineKeyboardButton(text=f"🧾 Итог дня: {'вкл' if user.daily_summary_enabled else 'выкл'}", callback_data="settings:summary")],
     ])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
     await callback.message.answer("⚙️ <b>Настройки</b>", reply_markup=kb)
     await callback.answer()
 
@@ -701,6 +753,11 @@ async def settings_calories_save(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "settings:target_weight")
 async def settings_target(callback: CallbackQuery, state: FSMContext) -> None:
+    async with SessionLocal() as session:
+        user = await get_user(session, callback.from_user.id)
+    if user and user.age < 18:
+        await callback.answer("Для подростков фиксированный вес-цель не управляет расчётом.", show_alert=True)
+        return
     await state.set_state(SettingsFlow.target_weight)
     await callback.message.answer("Введи новую цель по весу в кг.")
     await callback.answer()
@@ -861,7 +918,11 @@ async def recipe_preference(callback: CallbackQuery, state: FSMContext) -> None:
     payload = [x.model_dump() for x in items]
     await state.update_data(recipes=payload, recipe_pref=pref)
     await state.set_state(RecipeFlow.choosing_recipe)
-    lines = [f"У тебя осталось примерно <b>{left} ккал</b>.\n"]
+    lines = (
+        [f"Дневной ориентир: ~<b>{user.calorie_target} ккал</b>. Подберу порцию с учётом уже записанной еды.\n"]
+        if user.age < 18
+        else [f"У тебя осталось примерно <b>{left} ккал</b>.\n"]
+    )
     for idx, item in enumerate(payload, 1):
         lines.append(f"<b>{idx}. {item['title']}</b>\n~{item['calories']} ккал · {item['protein_g']} г белка · {item['minutes']} мин\n")
     await callback.message.answer("\n".join(lines), reply_markup=recipe_choices(len(payload)))
@@ -941,7 +1002,14 @@ async def recipe_cooked(callback: CallbackQuery, state: FSMContext) -> None:
         await add_food(session, user, draft)
         stats = await day_stats(session, user, date.today())
     await state.clear()
-    text = f"Добавил блюдо в рацион ✅\nСегодня: {stats['calories']} / {user.calorie_target} ккал"
+    if user.age < 18:
+        text = (
+            f"Добавил блюдо в рацион ✅\nСегодня записано: {stats['calories']} ккал\n"
+            f"Дневной ориентир: ~{user.calorie_target} ккал\n"
+            "Ориентир не нужно специально добирать."
+        )
+    else:
+        text = f"Добавил блюдо в рацион ✅\nСегодня: {stats['calories']} / {user.calorie_target} ккал"
     await callback.message.answer(text, reply_markup=MAIN_MENU)
     await callback.answer()
 
@@ -987,10 +1055,17 @@ async def natural_text(message: Message, state: FSMContext) -> None:
         async with SessionLocal() as session:
             user = await get_user(session, message.from_user.id)
             stats = await day_stats(session, user, date.today())
-        await message.answer(
-            f"Сегодня съедено {stats['calories']} / {user.calorie_target} ккал. "
-            f"Осталось примерно <b>{user.calorie_target - stats['calories']} ккал</b>."
-        )
+        if user.age < 18:
+            await message.answer(
+                f"Сегодня съедено <b>{stats['calories']} ккал</b>. "
+                f"Дневной ориентир — около <b>{user.calorie_target} ккал</b>. "
+                "Его не нужно специально добирать."
+            )
+        else:
+            await message.answer(
+                f"Сегодня съедено {stats['calories']} / {user.calorie_target} ккал. "
+                f"Осталось примерно <b>{user.calorie_target - stats['calories']} ккал</b>."
+            )
         return
 
     if any(x in text for x in ["что сегодня ел", "что я сегодня ел", "сегодня съел"]):

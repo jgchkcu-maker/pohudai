@@ -29,6 +29,9 @@ def _migrate_schema(sync_conn) -> None:
         _add_column_if_missing(
             sync_conn, "users", "last_tdee_recalc_at", "last_tdee_recalc_at TIMESTAMP NULL"
         )
+        _add_column_if_missing(
+            sync_conn, "users", "birth_date", "birth_date DATE NULL"
+        )
 
         # One-time bootstrap for users created under the old PAL questionnaire.
         # These values are only a migration seed; activity_level is ignored after

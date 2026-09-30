@@ -5,28 +5,23 @@ from datetime import date
 from statistics import mean
 from typing import Iterable
 
+from app.cdc_bmi import teen_bmi_status
 
-# Adult engine:
-# - Mifflin-St Jeor RMR
-# - 1.08 * RMR as a non-TEF low-activity baseline
-# - net walking + active workout calories
-# - TEF from actual intake for completed-day expenditure
-#
-# Teen engine:
-# - DRI 2023 inactive EER as the daily baseline (already a TEE/EER model)
-# - net walking + active workout calories
-# - no extra TEF term, because EER already represents total energy requirement.
+
 BASE_NON_TEF_FACTOR = 1.08
 TEF_RATE = 0.10
 ADULT_LOSS_RATE = 0.15
 ADULT_GAIN_SURPLUS_KCAL = 250.0
 
-# Conservative MVP guardrail for ages 14-17. This is intentionally not the
-# adult -15% rule. The app should not use the adult 7700-kcal/kg adaptive loop
-# for minors because growth and short-term water changes make it unreliable.
-TEEN_LOSS_RATE = 0.05
-TEEN_MAX_DEFICIT_KCAL = 200.0
+# Teen loss is deliberately slower than the adult -15% rule. The rate is a
+# product guardrail, not a clinical prescription. Eligibility comes from
+# sex- and age-specific CDC BMI-for-age rather than adult BMI cutoffs.
+TEEN_OBESITY_LOSS_RATE = 0.075
+TEEN_OBESITY_MAX_DEFICIT = 250.0
+TEEN_SEVERE_LOSS_RATE = 0.10
+TEEN_SEVERE_MAX_DEFICIT = 350.0
 TEEN_GAIN_SURPLUS_KCAL = 150.0
+TEEN_GROWTH_ALLOWANCE_KCAL = 20.0
 
 WALK_KCAL_PER_KG_KM = 0.50
 TERRAIN_MULTIPLIER = {
@@ -34,13 +29,7 @@ TERRAIN_MULTIPLIER = {
     "mixed": 1.10,
     "hills": 1.20,
 }
-
-# DRI 2023 inactive EER coefficients for ages 3-18:
-# intercept + age*coef + height_cm*coef + weight_kg*coef + growth allowance.
-YOUTH_INACTIVE_EER = {
-    "male": (-447.51, 3.68, 13.01, 13.15),
-    "female": (55.59, -22.25, 8.43, 17.07),
-}
+KJ_PER_KCAL = 4.184
 
 
 @dataclass(slots=True)
@@ -63,6 +52,9 @@ class Targets:
     is_youth: bool
     deficit_kcal: int
     rmr: int | None = None
+    bmi: float | None = None
+    bmi_category: str | None = None
+    formula_gap_pct: float | None = None
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -74,35 +66,57 @@ def mifflin_st_jeor(user) -> float:
     return base + 5 if user.sex == "male" else base - 161
 
 
-def rmr(user) -> float:
-    """Resting metabolic rate for adults.
+def teen_ree_molnar(user) -> float:
+    """Molnar adolescent REE equation.
 
-    Teen energy needs use DRI EER directly and deliberately do not flow through
-    this function, because EER is a total daily requirement, not an RMR.
+    The original equations return kJ/day. Convert explicitly to kcal/day.
     """
-    if user.age < 18:
-        raise ValueError("Teen users use DRI EER, not an RMR equation")
+    if user.sex == "male":
+        ree_kj = (
+            50.9 * user.current_weight_kg
+            + 25.3 * user.height_cm
+            - 50.3 * user.age
+            + 26.9
+        )
+    else:
+        ree_kj = (
+            51.2 * user.current_weight_kg
+            + 24.5 * user.height_cm
+            - 207.5 * user.age
+            + 1629.8
+        )
+    return ree_kj / KJ_PER_KCAL
+
+
+def teen_ree_mifflin_check(user) -> float:
+    """Independent sanity check, not the primary teen equation."""
     return mifflin_st_jeor(user)
 
 
-def youth_inactive_eer(user) -> float:
-    sex = user.sex if user.sex in YOUTH_INACTIVE_EER else "female"
-    intercept, age_coef, height_coef, weight_coef = YOUTH_INACTIVE_EER[sex]
-    growth_allowance = 20.0
-    return (
-        intercept
-        + age_coef * user.age
-        + height_coef * user.height_cm
-        + weight_coef * user.current_weight_kg
-        + growth_allowance
-    )
+def teen_ree(user) -> tuple[float, float]:
+    """Return primary teen REE and Molnar-vs-Mifflin disagreement in percent."""
+    molnar = teen_ree_molnar(user)
+    mifflin = teen_ree_mifflin_check(user)
+    midpoint = (molnar + mifflin) / 2.0
+    gap = abs(molnar - mifflin) / midpoint if midpoint > 0 else 0.0
+
+    # Molnar is primary. If two independent estimates disagree dramatically,
+    # use their midpoint so one equation cannot single-handedly create an
+    # extreme calorie target.
+    ree = midpoint if gap > 0.15 else molnar
+    return ree, gap * 100.0
+
+
+def rmr(user) -> float:
+    if user.age < 18:
+        return teen_ree(user)[0]
+    return mifflin_st_jeor(user)
 
 
 def ee_walk(user, km: float | None, terrain: str = "flat", pace: str = "normal") -> float:
-    """Additional walking cost above the baseline day.
+    """Additional walking cost above the low-activity baseline.
 
-    Pace is stored for future refinement but is intentionally not multiplied
-    into kcal/km in v3.1: speed changes kcal/min much more cleanly than kcal/km.
+    Pace is stored but does not multiply kcal/km in v3.x.
     """
     if km is None:
         return 0.0
@@ -125,15 +139,27 @@ def _usual_log(user) -> DailyLog:
     )
 
 
+def _teen_base(user, log: DailyLog) -> tuple[float, float]:
+    ree, formula_gap_pct = teen_ree(user)
+    correction = float(getattr(user, "tdee_correction", 0.0) or 0.0)
+    base = (
+        ree * BASE_NON_TEF_FACTOR
+        + TEEN_GROWTH_ALLOWANCE_KCAL
+        + ee_walk(user, log.km_walked, log.terrain, log.pace)
+        + max(0.0, float(log.workout_kcal or 0.0))
+        + correction
+    )
+    return base, formula_gap_pct
+
+
 def calculate_tdee_actual(user, log: DailyLog) -> float:
     correction = float(getattr(user, "tdee_correction", 0.0) or 0.0)
     walk = ee_walk(user, log.km_walked, log.terrain, log.pace)
     workout = max(0.0, float(log.workout_kcal or 0.0))
 
     if user.age < 18:
-        # DRI EER is already a total daily energy requirement, so no separate
-        # TEF term is added for teens.
-        return youth_inactive_eer(user) + walk + workout + correction
+        base, _ = _teen_base(user, log)
+        return base + tef(log.calories_consumed)
 
     return (
         rmr(user) * BASE_NON_TEF_FACTOR
@@ -145,58 +171,85 @@ def calculate_tdee_actual(user, log: DailyLog) -> float:
 
 
 def calculate_tdee(user, log: DailyLog) -> float:
-    """Compatibility alias for callers that want completed-day expenditure."""
     return calculate_tdee_actual(user, log)
 
 
-def calculate_targets(user, daily_log: DailyLog | None = None) -> Targets:
-    """Calculate the stable daily target from the user's usual activity.
+def _teen_target(user, log: DailyLog) -> Targets:
+    base, formula_gap_pct = _teen_base(user, log)
+    maintenance = base / (1.0 - TEF_RATE)
+    goal = getattr(user, "goal", "maintain")
 
-    The target intentionally uses usual_km, not today's partial km, so it does
-    not jump late in the evening. Completed-day expenditure uses actual km.
-    """
+    status = teen_bmi_status(
+        sex=user.sex,
+        birth_date=getattr(user, "birth_date", None),
+        height_cm=user.height_cm,
+        weight_kg=user.current_weight_kg,
+        fallback_age_years=user.age,
+    )
+
+    desired_deficit = 0.0
+    if goal == "lose" and status:
+        if status.category == "severe_obesity":
+            desired_deficit = min(
+                TEEN_SEVERE_MAX_DEFICIT,
+                maintenance * TEEN_SEVERE_LOSS_RATE,
+            )
+        elif status.category == "obesity":
+            desired_deficit = min(
+                TEEN_OBESITY_MAX_DEFICIT,
+                maintenance * TEEN_OBESITY_LOSS_RATE,
+            )
+        # For overweight but below the 95th percentile, the automatic engine
+        # uses maintenance: continued growth can improve BMI-for-age without
+        # forcing weight loss.
+
+    if goal == "gain":
+        calories = (base + TEEN_GAIN_SURPLUS_KCAL) / (1.0 - TEF_RATE)
+        desired_deficit = 0.0
+    elif desired_deficit > 0:
+        # Solve TDEE - intake = desired_deficit when TEF = 10% of intake.
+        calories = (base - desired_deficit) / (1.0 - TEF_RATE)
+    else:
+        calories = maintenance
+
+    protein_g = max(1, round(user.current_weight_kg * 0.85))
+    ree, _ = teen_ree(user)
+
+    return Targets(
+        maintenance=round(maintenance / 10) * 10,
+        calories=round(calories / 10) * 10,
+        protein_g=protein_g,
+        sedentary_eer=round((ree * BASE_NON_TEF_FACTOR + TEEN_GROWTH_ALLOWANCE_KCAL) / 10) * 10,
+        method="MOLNAR_CDC_TEEN_V3_2",
+        is_youth=True,
+        deficit_kcal=round(desired_deficit),
+        rmr=round(ree),
+        bmi=round(status.bmi, 1) if status else None,
+        bmi_category=status.category if status else None,
+        formula_gap_pct=round(formula_gap_pct, 1),
+    )
+
+
+def calculate_targets(user, daily_log: DailyLog | None = None) -> Targets:
+    """Stable daily target from usual activity; completed days use actual km."""
     log = daily_log or _usual_log(user)
+
+    if user.age < 18:
+        return _teen_target(user, log)
+
     correction = float(getattr(user, "tdee_correction", 0.0) or 0.0)
     walk = ee_walk(user, log.km_walked, log.terrain, log.pace)
     workout = max(0.0, float(log.workout_kcal or 0.0))
     goal = getattr(user, "goal", "maintain")
 
-    if user.age < 18:
-        maintenance = youth_inactive_eer(user) + walk + workout + correction
-        if goal == "lose":
-            deficit = min(TEEN_MAX_DEFICIT_KCAL, maintenance * TEEN_LOSS_RATE)
-            calories = maintenance - deficit
-        elif goal == "gain":
-            deficit = 0.0
-            calories = maintenance + TEEN_GAIN_SURPLUS_KCAL
-        else:
-            deficit = 0.0
-            calories = maintenance
-
-        protein_basis = user.current_weight_kg
-        target_weight = getattr(user, "target_weight_kg", None)
-        if goal == "lose" and target_weight and 35 <= target_weight < user.current_weight_kg:
-            protein_basis = target_weight
-
-        return Targets(
-            maintenance=round(maintenance / 10) * 10,
-            calories=round(calories / 10) * 10,
-            protein_g=max(1, round(protein_basis * 0.85)),
-            sedentary_eer=round(youth_inactive_eer(user) / 10) * 10,
-            method="DRI_EER_2023_TEEN",
-            is_youth=True,
-            deficit_kcal=round(deficit),
-            rmr=None,
-        )
-
     rmr_v = rmr(user)
-    # A excludes TEF. Solve the intake<->TEF relationship algebraically so the
-    # maintenance target is self-consistent instead of silently omitting TEF.
     a = rmr_v * BASE_NON_TEF_FACTOR + walk + workout + correction
-
     maintenance = a / (1.0 - TEF_RATE)
+
     if goal == "lose":
-        calories = (1.0 - ADULT_LOSS_RATE) * a / (1.0 - (1.0 - ADULT_LOSS_RATE) * TEF_RATE)
+        calories = (1.0 - ADULT_LOSS_RATE) * a / (
+            1.0 - (1.0 - ADULT_LOSS_RATE) * TEF_RATE
+        )
         calories = max(calories, rmr_v * 1.10)
     elif goal == "gain":
         calories = (a + ADULT_GAIN_SURPLUS_KCAL) / (1.0 - TEF_RATE)
@@ -234,10 +287,10 @@ def _weight_kg(entry) -> float:
 
 
 def recalc_from_history(user, weight_entries: Iterable, daily_logs: Iterable[DailyLog]) -> float:
-    """Return a smoothed adult TDEE correction from 14+ days of history.
+    """Adult-only 14+ day adaptive correction.
 
-    Uses a linear weight trend rather than first/last weight. Each update is
-    limited to 100 kcal/day and the total correction to +/-400 kcal/day.
+    Teen correction remains disabled: growth and body-composition changes make
+    a short 7700-kcal/kg feedback loop too noisy.
     """
     current = float(getattr(user, "tdee_correction", 0.0) or 0.0)
     if user.age < 18:
