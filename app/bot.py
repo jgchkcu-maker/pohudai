@@ -621,6 +621,7 @@ async def settings_calories_save(message: Message, state: FSMContext) -> None:
             )
             return
         user.calorie_target = int(value)
+        user.calorie_target_manual = True
         await session.commit()
     await state.clear()
     await message.answer(f"Дневная цель изменена: <b>{int(value)} ккал</b>", reply_markup=MAIN_MENU)
