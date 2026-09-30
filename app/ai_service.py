@@ -222,7 +222,7 @@ async def analyze_pantry_photo(image_bytes: bytes) -> PantryAnalysis:
 async def recipes(
     ingredients: str,
     preference: str,
-    calories_left: int,
+    calories_left: int | None,
     protein_left: int,
     profile_context: str | None = None,
 ) -> list[Recipe]:
@@ -234,11 +234,16 @@ async def recipes(
         "cheap": "подешевле",
     }
     profile = f"\nКонтекст пользователя:\n{profile_context}" if profile_context else ""
+    energy_context = (
+        f"На сегодня осталось примерно {calories_left} ккал."
+        if calories_left is not None
+        else "Не используй суточный остаток калорий как ограничение: предложи обычную сбалансированную порцию."
+    )
     prompt = f"""
 Предложи ровно 3 простых домашних рецепта на русском языке.
 Доступные продукты: {ingredients}.
 Приоритет: {pref_map.get(preference, preference)}.
-На сегодня осталось примерно {calories_left} ккал и желательно добрать около {protein_left} г белка.{profile}
+{energy_context} Желательно добрать около {protein_left} г белка.{profile}
 Не требуй экзотических ингредиентов. Можно добавить базовые продукты вроде соли, воды и небольшого количества масла, но явно укажи их.
 Калорийность и белок указывай для одной порции. Шаги короткие.
 """
