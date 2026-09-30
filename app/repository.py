@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
+from statistics import mean
+from types import SimpleNamespace
 
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.calculations import calculate_targets, estimate_expenditure
+from app.calculations import DailyLog, calculate_targets, calculate_tdee_actual, recalc_from_history
 from app.models import ActivityEntry, FoodEntry, User, WeightEntry
 
 
@@ -13,16 +15,30 @@ async def get_user(session: AsyncSession, tg_id: int) -> User | None:
     return await session.scalar(select(User).where(User.tg_id == tg_id))
 
 
+def _target_log(user: User) -> DailyLog:
+    return DailyLog(km_walked=user.usual_km, terrain="flat", pace="normal")
+
+
+def _apply_targets(user: User) -> None:
+    targets = calculate_targets(user, _target_log(user))
+    user.maintenance_calories = targets.maintenance
+    user.protein_target_g = targets.protein_g
+    if not user.calorie_target_manual:
+        user.calorie_target = targets.calories
+
+
 async def create_user(session: AsyncSession, tg_id: int, name: str | None, data: dict) -> User:
-    targets = calculate_targets(
-        data["sex"],
-        data["age"],
-        data["height_cm"],
-        data["weight_kg"],
-        data["activity_level"],
-        data["goal"],
-        data.get("target_weight_kg"),
+    profile = SimpleNamespace(
+        sex=data["sex"],
+        age=data["age"],
+        height_cm=data["height_cm"],
+        current_weight_kg=data["weight_kg"],
+        target_weight_kg=data.get("target_weight_kg"),
+        usual_km=float(data["usual_km"]),
+        tdee_correction=0.0,
+        goal=data["goal"],
     )
+    targets = calculate_targets(profile, DailyLog(km_walked=profile.usual_km))
     user = User(
         tg_id=tg_id,
         name=name,
@@ -32,7 +48,9 @@ async def create_user(session: AsyncSession, tg_id: int, name: str | None, data:
         initial_weight_kg=data["weight_kg"],
         current_weight_kg=data["weight_kg"],
         target_weight_kg=data.get("target_weight_kg"),
-        activity_level=data["activity_level"],
+        activity_level="legacy",
+        usual_km=profile.usual_km,
+        tdee_correction=0.0,
         goal=data["goal"],
         maintenance_calories=targets.maintenance,
         calorie_target=targets.calories,
@@ -48,20 +66,7 @@ async def create_user(session: AsyncSession, tg_id: int, name: str | None, data:
 
 async def add_weight(session: AsyncSession, user: User, weight_kg: float, measured_at: datetime | None = None) -> None:
     user.current_weight_kg = weight_kg
-    targets = calculate_targets(
-        user.sex,
-        user.age,
-        user.height_cm,
-        weight_kg,
-        user.activity_level,
-        user.goal,
-        user.target_weight_kg,
-    )
-    user.maintenance_calories = targets.maintenance
-    user.protein_target_g = targets.protein_g
-    if not user.calorie_target_manual:
-        user.calorie_target = targets.calories
-
+    _apply_targets(user)
     session.add(WeightEntry(user_id=user.id, measured_at=measured_at or datetime.now(), weight_kg=weight_kg))
     await session.commit()
 
@@ -84,23 +89,51 @@ async def add_food(session: AsyncSession, user: User, draft: dict, eaten_at: dat
     return item
 
 
+async def _refresh_usual_km(session: AsyncSession, user: User, anchor_day: date) -> None:
+    start = anchor_day - timedelta(days=13)
+    values = list(
+        await session.scalars(
+            select(ActivityEntry.km_walked)
+            .where(
+                ActivityEntry.user_id == user.id,
+                ActivityEntry.activity_date >= start,
+                ActivityEntry.activity_date <= anchor_day,
+                ActivityEntry.km_walked.is_not(None),
+            )
+            .order_by(ActivityEntry.activity_date)
+        )
+    )
+    if not values:
+        return
+    # A two-week rolling mean makes "usual km" adapt to actual evening answers
+    # while keeping the daily calorie target stable enough for normal use.
+    user.usual_km = round(sum(float(v) for v in values) / len(values), 2)
+    _apply_targets(user)
+
+
 async def upsert_activity(
     session: AsyncSession,
     user: User,
     activity_date: date,
-    steps: int,
-    workout_type: str | None = None,
-    workout_minutes: int = 0,
+    km_walked: float,
+    terrain: str = "flat",
+    pace: str = "normal",
+    workout_kcal: float = 0.0,
 ) -> ActivityEntry:
     item = await session.scalar(
         select(ActivityEntry).where(ActivityEntry.user_id == user.id, ActivityEntry.activity_date == activity_date)
     )
     if item is None:
-        item = ActivityEntry(user_id=user.id, activity_date=activity_date, steps=steps)
+        item = ActivityEntry(user_id=user.id, activity_date=activity_date)
         session.add(item)
-    item.steps = steps
-    item.workout_type = workout_type
-    item.workout_minutes = workout_minutes
+
+    item.km_walked = max(0.0, float(km_walked))
+    item.terrain = terrain if terrain in {"flat", "mixed", "hills"} else "flat"
+    item.pace = pace if pace in {"slow", "normal", "fast"} else "normal"
+    item.workout_kcal = max(0.0, float(workout_kcal))
+
+    await session.flush()
+    await _refresh_usual_km(session, user, activity_date)
     await session.commit()
     return item
 
@@ -129,34 +162,36 @@ async def day_stats(session: AsyncSession, user: User, day: date) -> dict:
     protein = sum(x.protein_g for x in foods)
     fat = sum(x.fat_g for x in foods)
     carbs = sum(x.carbs_g for x in foods)
-    steps = activity.steps if activity else 0
-    workout_type = activity.workout_type if activity else None
-    workout_minutes = activity.workout_minutes if activity else 0
-    targets = calculate_targets(
-        user.sex,
-        user.age,
-        user.height_cm,
-        user.current_weight_kg,
-        user.activity_level,
-        user.goal,
-        user.target_weight_kg,
+
+    km_walked = activity.km_walked if activity else None
+    terrain = activity.terrain if activity else "flat"
+    pace = activity.pace if activity else "normal"
+    workout_kcal = activity.workout_kcal if activity else 0.0
+
+    log = DailyLog(
+        day=day,
+        km_walked=km_walked,
+        terrain=terrain,
+        pace=pace,
+        workout_kcal=workout_kcal,
+        calories_consumed=calories,
     )
-    expenditure = estimate_expenditure(
-        targets.sedentary_eer,
-        user.current_weight_kg,
-        steps,
-        workout_type,
-        workout_minutes,
-    )
+    expenditure = round(calculate_tdee_actual(user, log))
+
     return {
         "foods": foods,
         "calories": round(calories),
         "protein": round(protein),
         "fat": round(fat),
         "carbs": round(carbs),
-        "steps": steps,
-        "workout_type": workout_type,
-        "workout_minutes": workout_minutes,
+        "km_walked": km_walked,
+        "terrain": terrain,
+        "pace": pace,
+        "workout_kcal": round(workout_kcal),
+        # legacy keys kept temporarily for callers that have not migrated yet
+        "steps": activity.steps if activity else 0,
+        "workout_type": activity.workout_type if activity else None,
+        "workout_minutes": activity.workout_minutes if activity else 0,
         "expenditure": expenditure,
         "deficit": round(expenditure - calories),
     }
@@ -166,7 +201,7 @@ async def stats_period(session: AsyncSession, user: User, days: int) -> dict:
     today = date.today()
     start_day = today - timedelta(days=days - 1)
     daily = [await day_stats(session, user, start_day + timedelta(days=i)) for i in range(days)]
-    tracked = [d for d in daily if d["foods"] or d["steps"] or d["workout_minutes"]]
+    tracked = [d for d in daily if d["foods"] or d["km_walked"] is not None or d["workout_kcal"]]
     denom = len(tracked) or 1
 
     weights = list(
@@ -178,17 +213,88 @@ async def stats_period(session: AsyncSession, user: User, days: int) -> dict:
     )
     first_weight = weights[0].weight_kg if weights else user.current_weight_kg
     last_weight = weights[-1].weight_kg if weights else user.current_weight_kg
-    in_target = sum(1 for d in tracked if abs(d["calories"] - user.calorie_target) <= max(100, user.calorie_target * 0.08))
+    in_target = sum(
+        1
+        for d in tracked
+        if abs(d["calories"] - user.calorie_target) <= max(100, user.calorie_target * 0.08)
+    )
+    km_days = [d["km_walked"] for d in tracked if d["km_walked"] is not None]
     return {
         "avg_calories": round(sum(d["calories"] for d in tracked) / denom),
         "avg_deficit": round(sum(d["deficit"] for d in tracked) / denom),
-        "avg_steps": round(sum(d["steps"] for d in tracked) / denom),
+        "avg_km": round(sum(km_days) / len(km_days), 1) if km_days else 0.0,
         "avg_protein": round(sum(d["protein"] for d in tracked) / denom),
         "tracked_days": len(tracked),
         "in_target_days": in_target,
         "first_weight": first_weight,
         "last_weight": last_weight,
         "weight_change": round(last_weight - first_weight, 1),
+    }
+
+
+async def _history_logs(session: AsyncSession, user: User, start_day: date, end_day: date) -> list[DailyLog]:
+    logs: list[DailyLog] = []
+    day = start_day
+    while day <= end_day:
+        foods = await foods_for_day(session, user, day)
+        activity = await activity_for_day(session, user, day)
+        if foods and activity and activity.km_walked is not None:
+            logs.append(
+                DailyLog(
+                    day=day,
+                    km_walked=activity.km_walked,
+                    terrain=activity.terrain,
+                    pace=activity.pace,
+                    workout_kcal=activity.workout_kcal,
+                    calories_consumed=sum(x.calories for x in foods),
+                )
+            )
+        day += timedelta(days=1)
+    return logs
+
+
+async def recalibrate_tdee(session: AsyncSession, user: User, now: datetime | None = None) -> dict | None:
+    """Recalculate adult correction at most once per 14 days."""
+    now = now or datetime.now()
+    if user.age < 18:
+        return None
+    if user.last_tdee_recalc_at and now - user.last_tdee_recalc_at < timedelta(days=14):
+        return None
+
+    start_dt = now - timedelta(days=28)
+    weights = list(
+        await session.scalars(
+            select(WeightEntry)
+            .where(WeightEntry.user_id == user.id, WeightEntry.measured_at >= start_dt)
+            .order_by(WeightEntry.measured_at)
+        )
+    )
+    logs = await _history_logs(session, user, start_dt.date(), now.date())
+    if len(weights) < 6 or len(logs) < 10:
+        return None
+    span_days = (weights[-1].measured_at.date() - weights[0].measured_at.date()).days
+    if span_days < 14:
+        return None
+
+    old_correction = float(user.tdee_correction or 0.0)
+    avg_intake = mean(x.calories_consumed for x in logs)
+    avg_predicted = mean(calculate_tdee_actual(user, x) for x in logs)
+    predicted_change = (avg_intake - avg_predicted) * span_days / 7700.0
+    actual_change = weights[-1].weight_kg - weights[0].weight_kg
+
+    new_correction = recalc_from_history(user, weights, logs)
+    user.tdee_correction = new_correction
+    user.last_tdee_recalc_at = now
+    _apply_targets(user)
+    await session.commit()
+
+    return {
+        "old_correction": old_correction,
+        "new_correction": new_correction,
+        "delta_correction": new_correction - old_correction,
+        "predicted_change": predicted_change,
+        "actual_change": actual_change,
+        "new_target": user.calorie_target,
     }
 
 
