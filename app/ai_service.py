@@ -15,6 +15,19 @@ openai_client = AsyncOpenAI(api_key=settings.openai_api_key) if settings.openai_
 gemini_client = genai.Client(api_key=settings.gemini_api_key) if settings.gemini_api_key else None
 
 
+NUTRITION_COACH_SYSTEM = """
+Ты — помощник дневника питания. Ты не назначаешь лечение и не заменяешь врача.
+
+Жёсткие правила:
+1. Числа maintenance_calories, calorie_target и protein_target_g приходят из детерминированного расчётного движка. Не пересчитывай и не изменяй их сам.
+2. Не обещай точность расхода энергии: называй его оценочным.
+3. Для пользователей 18 лет и младше не поощряй большие дефициты, голодание, пропуск еды или быстрый сброс веса. Их calorie_target является ориентиром для ведения дневника, а не назначением на похудение.
+4. Не подгоняй оценку калорий конкретного блюда под вес, возраст или цель пользователя: состав еды оценивается независимо.
+5. В рекомендациях отдавай приоритет обычной еде, достаточному белку, овощам/фруктам и реалистичным порциям. Не делай моральных оценок еды.
+6. Если данных мало, прямо говори об неопределённости вместо выдумывания точности.
+"""
+
+
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -73,7 +86,12 @@ def _pantry_schema() -> dict:
     return PantryAnalysis.model_json_schema()
 
 
-async def _openai_json_response(prompt: str, schema: dict, image_bytes: bytes | None = None) -> dict:
+async def _openai_json_response(
+    prompt: str,
+    schema: dict,
+    image_bytes: bytes | None = None,
+    system_instruction: str | None = None,
+) -> dict:
     if openai_client is None:
         raise RuntimeError("OPENAI_API_KEY is not configured")
 
@@ -82,9 +100,14 @@ async def _openai_json_response(prompt: str, schema: dict, image_bytes: bytes | 
         data = base64.b64encode(image_bytes).decode("ascii")
         content.append({"type": "input_image", "image_url": f"data:image/jpeg;base64,{data}"})
 
+    messages: list[dict] = []
+    if system_instruction:
+        messages.append({"role": "system", "content": system_instruction})
+    messages.append({"role": "user", "content": content})
+
     response = await openai_client.responses.create(
         model=settings.openai_model,
-        input=[{"role": "user", "content": content}],
+        input=messages,
         text={
             "format": {
                 "type": "json_schema",
@@ -97,7 +120,12 @@ async def _openai_json_response(prompt: str, schema: dict, image_bytes: bytes | 
     return json.loads(response.output_text)
 
 
-async def _gemini_json_response(prompt: str, schema: dict, image_bytes: bytes | None = None) -> dict:
+async def _gemini_json_response(
+    prompt: str,
+    schema: dict,
+    image_bytes: bytes | None = None,
+    system_instruction: str | None = None,
+) -> dict:
     if gemini_client is None:
         raise RuntimeError("GEMINI_API_KEY is not configured")
 
@@ -109,6 +137,7 @@ async def _gemini_json_response(prompt: str, schema: dict, image_bytes: bytes | 
         model=settings.gemini_model,
         contents=contents,
         config=types.GenerateContentConfig(
+            system_instruction=system_instruction,
             response_mime_type="application/json",
             response_json_schema=schema,
         ),
@@ -118,20 +147,25 @@ async def _gemini_json_response(prompt: str, schema: dict, image_bytes: bytes | 
     return json.loads(response.text)
 
 
-async def _json_response(prompt: str, schema: dict, image_bytes: bytes | None = None) -> dict:
+async def _json_response(
+    prompt: str,
+    schema: dict,
+    image_bytes: bytes | None = None,
+    system_instruction: str | None = None,
+) -> dict:
     provider = settings.ai_provider.strip().lower()
 
     if provider == "gemini":
-        return await _gemini_json_response(prompt, schema, image_bytes)
+        return await _gemini_json_response(prompt, schema, image_bytes, system_instruction)
 
     if provider == "openai":
-        return await _openai_json_response(prompt, schema, image_bytes)
+        return await _openai_json_response(prompt, schema, image_bytes, system_instruction)
 
     if provider == "auto":
         if gemini_client is not None:
-            return await _gemini_json_response(prompt, schema, image_bytes)
+            return await _gemini_json_response(prompt, schema, image_bytes, system_instruction)
         if openai_client is not None:
-            return await _openai_json_response(prompt, schema, image_bytes)
+            return await _openai_json_response(prompt, schema, image_bytes, system_instruction)
         raise RuntimeError("Neither GEMINI_API_KEY nor OPENAI_API_KEY is configured")
 
     raise RuntimeError(f"Unsupported AI_PROVIDER: {settings.ai_provider}")
@@ -185,7 +219,13 @@ async def analyze_pantry_photo(image_bytes: bytes) -> PantryAnalysis:
     )
 
 
-async def recipes(ingredients: str, preference: str, calories_left: int, protein_left: int) -> list[Recipe]:
+async def recipes(
+    ingredients: str,
+    preference: str,
+    calories_left: int,
+    protein_left: int,
+    profile_context: str | None = None,
+) -> list[Recipe]:
     pref_map = {
         "tasty": "самое вкусное",
         "fast": "максимально быстро",
@@ -193,13 +233,20 @@ async def recipes(ingredients: str, preference: str, calories_left: int, protein
         "light": "поменьше калорий",
         "cheap": "подешевле",
     }
+    profile = f"\nКонтекст пользователя:\n{profile_context}" if profile_context else ""
     prompt = f"""
 Предложи ровно 3 простых домашних рецепта на русском языке.
 Доступные продукты: {ingredients}.
 Приоритет: {pref_map.get(preference, preference)}.
-На сегодня осталось примерно {calories_left} ккал и желательно добрать около {protein_left} г белка.
+На сегодня осталось примерно {calories_left} ккал и желательно добрать около {protein_left} г белка.{profile}
 Не требуй экзотических ингредиентов. Можно добавить базовые продукты вроде соли, воды и небольшого количества масла, но явно укажи их.
 Калорийность и белок указывай для одной порции. Шаги короткие.
 """
-    data = RecipeSet.model_validate(await _json_response(prompt, _recipe_schema()))
+    data = RecipeSet.model_validate(
+        await _json_response(
+            prompt,
+            _recipe_schema(),
+            system_instruction=NUTRITION_COACH_SYSTEM,
+        )
+    )
     return data.recipes[:3]
