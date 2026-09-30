@@ -15,7 +15,13 @@ async def get_user(session: AsyncSession, tg_id: int) -> User | None:
 
 async def create_user(session: AsyncSession, tg_id: int, name: str | None, data: dict) -> User:
     targets = calculate_targets(
-        data["sex"], data["age"], data["height_cm"], data["weight_kg"], data["activity_level"], data["goal"]
+        data["sex"],
+        data["age"],
+        data["height_cm"],
+        data["weight_kg"],
+        data["activity_level"],
+        data["goal"],
+        data.get("target_weight_kg"),
     )
     user = User(
         tg_id=tg_id,
@@ -111,8 +117,22 @@ async def day_stats(session: AsyncSession, user: User, day: date) -> dict:
     steps = activity.steps if activity else 0
     workout_type = activity.workout_type if activity else None
     workout_minutes = activity.workout_minutes if activity else 0
-    targets = calculate_targets(user.sex, user.age, user.height_cm, user.current_weight_kg, user.activity_level, user.goal)
-    expenditure = estimate_expenditure(targets.bmr, user.current_weight_kg, steps, workout_type, workout_minutes)
+    targets = calculate_targets(
+        user.sex,
+        user.age,
+        user.height_cm,
+        user.current_weight_kg,
+        user.activity_level,
+        user.goal,
+        user.target_weight_kg,
+    )
+    expenditure = estimate_expenditure(
+        targets.sedentary_eer,
+        user.current_weight_kg,
+        steps,
+        workout_type,
+        workout_minutes,
+    )
     return {
         "foods": foods,
         "calories": round(calories),
