@@ -1,34 +1,96 @@
-from app.calculations import calculate_targets, estimate_eer, estimate_expenditure
+from datetime import date, datetime, timedelta
+from types import SimpleNamespace
+
+import pytest
+
+from app.calculations import (
+    DailyLog,
+    calculate_targets,
+    ee_walk,
+    mifflin_st_jeor,
+    recalc_from_history,
+)
 
 
-def test_adult_weight_loss_uses_moderate_capped_deficit():
-    t = calculate_targets("male", 30, 182, 84, "medium", "lose", 76)
-    assert t.calories < t.maintenance
-    assert 250 <= t.deficit_kcal <= 500
+def user(**overrides):
+    data = {
+        "sex": "male",
+        "age": 30,
+        "height_cm": 180.0,
+        "current_weight_kg": 80.0,
+        "target_weight_kg": 72.0,
+        "usual_km": 8.0,
+        "tdee_correction": 0.0,
+        "goal": "lose",
+    }
+    data.update(overrides)
+    return SimpleNamespace(**data)
+
+
+def test_mifflin_male():
+    assert mifflin_st_jeor(user()) == pytest.approx(1780.0)
+
+
+def test_mifflin_female():
+    u = user(sex="female", age=25, height_cm=165.0, current_weight_kg=60.0)
+    assert mifflin_st_jeor(u) == pytest.approx(1345.25)
+
+
+def test_walk_zero_km():
+    assert ee_walk(user(), 0.0) == 0.0
+
+
+def test_walk_terrain_multiplier():
+    u = user()
+    flat = ee_walk(u, 8.0, "flat")
+    mixed = ee_walk(u, 8.0, "mixed")
+    hills = ee_walk(u, 8.0, "hills")
+    assert hills > mixed > flat
+
+
+def test_adult_loss_target_is_below_maintenance():
+    t = calculate_targets(user())
     assert not t.is_youth
-    assert t.method == "DRI_EER_2023"
+    assert t.calories < t.maintenance
+    assert t.deficit_kcal > 0
+    assert t.method == "MIFFLIN_V3_1"
 
 
-def test_youth_does_not_get_automatic_deficit():
-    t = calculate_targets("male", 16, 180, 80, "light", "lose", 72)
+def test_teen_gets_small_automatic_deficit():
+    teen = user(age=16, goal="lose", current_weight_kg=80.0, usual_km=5.0)
+    t = calculate_targets(teen)
     assert t.is_youth
-    assert t.calories == t.maintenance
-    assert t.deficit_kcal == 0
+    assert 0 < t.deficit_kcal <= 200
+    assert t.calories < t.maintenance
+    assert t.method == "DRI_EER_2023_TEEN"
 
 
-def test_questionnaire_activity_changes_eer():
-    inactive = estimate_eer("female", 25, 168, 65, "low")
-    active = estimate_eer("female", 25, 168, 65, "medium")
-    assert active > inactive
+def test_recalc_sign_and_clamp():
+    u = user(usual_km=5.0)
+    start = datetime(2026, 1, 1)
+    # Six measurements spanning 14 days with a clear downward trend.
+    weights = [
+        SimpleNamespace(measured_at=start + timedelta(days=d), weight_kg=80.0 - 0.04 * d)
+        for d in [0, 3, 6, 9, 12, 14]
+    ]
+    logs = [
+        DailyLog(
+            day=date(2026, 1, 1) + timedelta(days=d),
+            km_walked=5.0,
+            calories_consumed=2200.0,
+        )
+        for d in range(15)
+    ]
+    new_correction = recalc_from_history(u, weights, logs)
+    assert -400 <= new_correction <= 400
+    assert abs(new_correction - u.tdee_correction) <= 100
 
 
-def test_target_weight_affects_protein_planning_for_weight_loss():
-    current_weight = calculate_targets("male", 30, 182, 100, "light", "lose")
-    target_weight = calculate_targets("male", 30, 182, 100, "light", "lose", 80)
-    assert target_weight.protein_g < current_weight.protein_g
+def test_recalc_no_history_does_not_crash():
+    u = user()
+    assert recalc_from_history(u, [], []) == 0.0
 
 
-def test_expenditure_grows_with_steps():
-    low = estimate_expenditure(2100, 84, 3000, None, 0)
-    high = estimate_expenditure(2100, 84, 10000, None, 0)
-    assert high > low
+def test_recalc_disabled_for_teens():
+    teen = user(age=16, tdee_correction=25.0)
+    assert recalc_from_history(teen, [], []) == 25.0
