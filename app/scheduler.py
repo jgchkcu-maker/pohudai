@@ -30,13 +30,20 @@ async def send_daily_summary(bot: Bot) -> None:
             stats = await day_stats(session, user, date.today())
             if not stats["foods"] and not stats["steps"]:
                 continue
-            text = (
-                f"🧾 <b>Итоги дня</b>\n\n🍽 {stats['calories']} / {user.calorie_target} ккал\n"
-                f"🚶 {stats['steps']} шагов\n🔥 Расчётный дефицит: ~{stats['deficit']} ккал\n"
-                f"🥩 Белок: {stats['protein']} г\n\nХорошего вечера 👋"
-            )
-            if stats["deficit"] > 900:
-                text += "\n\nСегодня получился довольно большой расчётный дефицит. Необязательно стараться делать его как можно больше — устойчивый режим обычно удобнее соблюдать."
+            if user.age <= 18:
+                text = (
+                    f"🧾 <b>Итоги дня</b>\n\n🍽 Записано: {stats['calories']} ккал\n"
+                    f"🚶 {stats['steps']} шагов\n"
+                    f"🥩 Белок: {stats['protein']} г\n\nХорошего вечера 👋"
+                )
+            else:
+                text = (
+                    f"🧾 <b>Итоги дня</b>\n\n🍽 {stats['calories']} / {user.calorie_target} ккал\n"
+                    f"🚶 {stats['steps']} шагов\n🔥 Расчётный дефицит: ~{stats['deficit']} ккал\n"
+                    f"🥩 Белок: {stats['protein']} г\n\nХорошего вечера 👋"
+                )
+                if stats["deficit"] > 900:
+                    text += "\n\nСегодня получился довольно большой расчётный дефицит. Необязательно стараться делать его как можно больше — устойчивый режим обычно удобнее соблюдать."
             try:
                 await bot.send_message(user.tg_id, text)
             except Exception:
