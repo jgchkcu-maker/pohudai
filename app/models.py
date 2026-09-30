@@ -18,6 +18,7 @@ class User(Base):
     name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     sex: Mapped[str] = mapped_column(String(16))
     age: Mapped[int] = mapped_column(Integer)
+    birth_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     height_cm: Mapped[float] = mapped_column(Float)
     initial_weight_kg: Mapped[float] = mapped_column(Float)
     current_weight_kg: Mapped[float] = mapped_column(Float)
