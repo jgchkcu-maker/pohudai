@@ -115,6 +115,20 @@ def _draft(analysis: FoodAnalysis, source: str) -> dict:
     return result
 
 
+def _nutrition_profile_context(user) -> str:
+    goal_map = {"lose": "снижение веса", "maintain": "поддержание веса", "gain": "набор веса"}
+    return (
+        f"Возраст: {user.age}. Пол: {user.sex}. Рост: {user.height_cm:.0f} см. "
+        f"Текущий вес: {user.current_weight_kg:.1f} кг. "
+        f"Цель: {goal_map.get(user.goal, user.goal)}. "
+        f"Целевой вес: {user.target_weight_kg if user.target_weight_kg else 'не задан'}. "
+        f"Оценочная поддерживающая потребность: {user.maintenance_calories} ккал/день. "
+        f"Дневной ориентир дневника: {user.calorie_target} ккал. "
+        f"Белковый ориентир: {user.protein_target_g} г/день. "
+        f"Возраст до 19 лет: {'да' if user.age <= 18 else 'нет'}."
+    )
+
+
 async def _registered(message: Message) -> bool:
     async with SessionLocal() as session:
         return await get_user(session, message.from_user.id) is not None
@@ -267,10 +281,28 @@ async def _finish_onboarding(message: Message, tg_id: int, name: str | None, sta
     async with SessionLocal() as session:
         user = await create_user(session, tg_id, name, data)
     await state.clear()
-    target = f"\nЦель: {user.target_weight_kg:.1f} кг" if user.target_weight_kg else ""
+    target = f"\nЦель по весу: {user.target_weight_kg:.1f} кг" if user.target_weight_kg else ""
+    if user.age <= 18:
+        calculation_note = (
+            "\n\n<i>Расчёт сделан по возрастной формуле DRI/EER 2023. "
+            "Поскольку тебе 18 или меньше, бот не назначает автоматический дефицит: "
+            "дневная цель пока используется как ориентир для дневника и оценки привычек.</i>"
+        )
+    else:
+        deficit = max(0, user.maintenance_calories - user.calorie_target)
+        calculation_note = (
+            f"\n\n<i>Стартовый расчёт: DRI/EER 2023. "
+            f"Ориентировочный дефицит: ~{deficit} ккал/день. "
+            "Дальше важнее смотреть на фактическую динамику веса и активности.</i>"
+        )
+
     await message.answer(
-        f"Готово ✅\n\nТвоя примерная норма поддержания:\n<b>{user.maintenance_calories} ккал</b>\n\n"
-        f"Дневная цель:\n<b>{user.calorie_target} ккал</b>{target}\n\nНачальный вес: {user.initial_weight_kg:.1f} кг",
+        f"Готово ✅\n\nОценочная потребность для поддержания:\n"
+        f"<b>{user.maintenance_calories} ккал/день</b>\n\n"
+        f"Дневной ориентир:\n<b>{user.calorie_target} ккал</b>\n"
+        f"Белок: ~{user.protein_target_g} г/день{target}\n"
+        f"Начальный вес: {user.initial_weight_kg:.1f} кг"
+        f"{calculation_note}",
         reply_markup=MAIN_MENU,
     )
 
@@ -578,6 +610,16 @@ async def settings_calories_save(message: Message, state: FSMContext) -> None:
         return
     async with SessionLocal() as session:
         user = await get_user(session, message.from_user.id)
+        if not user:
+            await state.clear()
+            return
+        if user.age <= 18 and value < user.maintenance_calories:
+            await message.answer(
+                f"Для пользователей до 19 лет я не ставлю автоматическую цель ниже "
+                f"оценочной потребности поддержания ({user.maintenance_calories} ккал). "
+                "Можно продолжать вести дневник по этому ориентиру."
+            )
+            return
         user.calorie_target = int(value)
         await session.commit()
     await state.clear()
@@ -724,7 +766,13 @@ async def recipe_preference(callback: CallbackQuery, state: FSMContext) -> None:
     left = max(200, user.calorie_target - today_stats["calories"])
     protein_left = max(0, user.protein_target_g - today_stats["protein"])
     await callback.message.answer("Подбираю варианты…")
-    items = await recipes(data["recipe_ingredients"], pref, left, protein_left)
+    items = await recipes(
+        data["recipe_ingredients"],
+        pref,
+        left,
+        protein_left,
+        profile_context=_nutrition_profile_context(user),
+    )
     payload = [x.model_dump() for x in items]
     await state.update_data(recipes=payload, recipe_pref=pref)
     await state.set_state(RecipeFlow.choosing_recipe)
@@ -745,7 +793,13 @@ async def recipe_pick(callback: CallbackQuery, state: FSMContext) -> None:
             stats = await day_stats(session, user, date.today()) if user else None
         if not user or not stats:
             return
-        items = await recipes(data["recipe_ingredients"], data.get("recipe_pref", "tasty"), max(200, user.calorie_target - stats["calories"]), max(0, user.protein_target_g - stats["protein"]))
+        items = await recipes(
+            data["recipe_ingredients"],
+            data.get("recipe_pref", "tasty"),
+            max(200, user.calorie_target - stats["calories"]),
+            max(0, user.protein_target_g - stats["protein"]),
+            profile_context=_nutrition_profile_context(user),
+        )
         payload = [x.model_dump() for x in items]
         await state.update_data(recipes=payload)
         await callback.message.answer("Ещё варианты:", reply_markup=recipe_choices(len(payload)))
