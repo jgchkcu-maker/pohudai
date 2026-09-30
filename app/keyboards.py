@@ -16,13 +16,6 @@ SEX_KB = InlineKeyboardMarkup(inline_keyboard=[[
     InlineKeyboardButton(text="Женский", callback_data="sex:female"),
 ]])
 
-ACTIVITY_KB = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="🛋 В основном сижу", callback_data="activity:low")],
-    [InlineKeyboardButton(text="🚶 ~45–60 мин ходьбы/день", callback_data="activity:light")],
-    [InlineKeyboardButton(text="🏃 Много двигаюсь / тренировки", callback_data="activity:medium")],
-    [InlineKeyboardButton(text="💪 Очень высокая активность", callback_data="activity:high")],
-])
-
 GOAL_KB = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="🔥 Похудеть", callback_data="goal:lose")],
     [InlineKeyboardButton(text="⚖️ Поддерживать вес", callback_data="goal:maintain")],
@@ -50,10 +43,19 @@ FOOD_CONFIRM_KB = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")],
 ])
 
-WORKOUT_KB = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="Нет", callback_data="workout:none")],
-    [InlineKeyboardButton(text="🏋️ Силовая", callback_data="workout:strength"), InlineKeyboardButton(text="🏃 Бег", callback_data="workout:run")],
-    [InlineKeyboardButton(text="🚴 Велосипед", callback_data="workout:bike"), InlineKeyboardButton(text="⚽ Другая", callback_data="workout:other")],
+TERRAIN_KB = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="🛣 Ровный", callback_data="terrain:flat"), InlineKeyboardButton(text="⛰ Холмы", callback_data="terrain:hills")],
+    [InlineKeyboardButton(text="〰️ Смешанный", callback_data="terrain:mixed"), InlineKeyboardButton(text="➡️ Пропустить", callback_data="terrain:skip")],
+])
+
+PACE_KB = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="🐢 Медленный", callback_data="pace:slow"), InlineKeyboardButton(text="🚶 Обычный", callback_data="pace:normal")],
+    [InlineKeyboardButton(text="⚡ Быстрый", callback_data="pace:fast"), InlineKeyboardButton(text="➡️ Пропустить", callback_data="pace:skip")],
+])
+
+WORKOUT_KCAL_KB = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="Нет тренировки", callback_data="workout_kcal:none")],
+    [InlineKeyboardButton(text="⌚ Ввести активные ккал", callback_data="workout_kcal:enter")],
 ])
 
 RECIPE_PREF_KB = InlineKeyboardMarkup(inline_keyboard=[
