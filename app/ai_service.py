@@ -55,12 +55,22 @@ class RecipeSet(StrictModel):
     recipes: list[Recipe]
 
 
+class PantryAnalysis(StrictModel):
+    ingredients: list[str]
+    confidence: float = Field(ge=0, le=1)
+    notes: str | None = None
+
+
 def _food_schema() -> dict:
     return FoodAnalysis.model_json_schema()
 
 
 def _recipe_schema() -> dict:
     return RecipeSet.model_json_schema()
+
+
+def _pantry_schema() -> dict:
+    return PantryAnalysis.model_json_schema()
 
 
 async def _openai_json_response(prompt: str, schema: dict, image_bytes: bytes | None = None) -> dict:
@@ -159,6 +169,19 @@ async def analyze_food_photo(
 """
     return FoodAnalysis.model_validate(
         await _json_response(prompt, _food_schema(), image_bytes=image_bytes)
+    )
+
+
+async def analyze_pantry_photo(image_bytes: bytes) -> PantryAnalysis:
+    prompt = """
+Посмотри на фотографию продуктов, холодильника, кухонного стола или кладовой.
+Верни только те продукты и ингредиенты, которые действительно видны и достаточно узнаваемы.
+Не выдумывай скрытые продукты и не превращай готовое блюдо в длинный список предполагаемых ингредиентов.
+Названия делай короткими: например "яйца", "сыр", "помидоры", "куриная грудка".
+Если продукт не удаётся уверенно определить, не добавляй его в список, а кратко упомяни неопределённость в notes.
+"""
+    return PantryAnalysis.model_validate(
+        await _json_response(prompt, _pantry_schema(), image_bytes=image_bytes)
     )
 
 
