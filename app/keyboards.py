@@ -17,10 +17,10 @@ SEX_KB = InlineKeyboardMarkup(inline_keyboard=[[
 ]])
 
 ACTIVITY_KB = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="🛋 Почти не двигаюсь", callback_data="activity:low")],
-    [InlineKeyboardButton(text="🚶 Немного двигаюсь", callback_data="activity:light")],
-    [InlineKeyboardButton(text="🏃 Средняя активность", callback_data="activity:medium")],
-    [InlineKeyboardButton(text="💪 Очень активный", callback_data="activity:high")],
+    [InlineKeyboardButton(text="🛋 В основном сижу", callback_data="activity:low")],
+    [InlineKeyboardButton(text="🚶 ~45–60 мин ходьбы/день", callback_data="activity:light")],
+    [InlineKeyboardButton(text="🏃 Много двигаюсь / тренировки", callback_data="activity:medium")],
+    [InlineKeyboardButton(text="💪 Очень высокая активность", callback_data="activity:high")],
 ])
 
 GOAL_KB = InlineKeyboardMarkup(inline_keyboard=[
