@@ -13,8 +13,9 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from app.ai_service import FoodAnalysis, analyze_food_photo, analyze_food_text, recipes
+from app.ai_service import FoodAnalysis, analyze_food_photo, analyze_food_text, analyze_pantry_photo, recipes
 from app.db import SessionLocal
+from app.intents import is_photo_question, looks_like_question
 from app.keyboards import (
     ACTIVITY_KB,
     FOOD_CONFIRM_KB,
@@ -652,15 +653,61 @@ async def noop(callback: CallbackQuery) -> None:
 @router.message(F.text == "🍳 Что приготовить")
 async def recipe_start(message: Message, state: FSMContext) -> None:
     await state.set_state(RecipeFlow.waiting_ingredients)
-    await message.answer("Из чего будем готовить?\n\nНапиши продукты, которые есть дома.")
+    await message.answer(
+        "Из чего будем готовить?\n\n"
+        "Напиши продукты, которые есть дома, или отправь 📸 фото продуктов/холодильника."
+    )
 
 
 @router.message(RecipeFlow.waiting_ingredients)
 async def recipe_ingredients(message: Message, state: FSMContext) -> None:
-    if not message.text:
-        await message.answer("Пока здесь нужен текстовый список продуктов.")
+    if message.photo:
+        await message.answer("Смотрю, какие продукты есть на фото…")
+        image = await _get_image(message.bot, message.photo[-1].file_id)
+        pantry = await analyze_pantry_photo(image)
+
+        if not pantry.ingredients:
+            await message.answer(
+                "Не смог уверенно распознать продукты на этом фото. "
+                "Попробуй снять их чуть ближе или напиши список текстом."
+            )
+            return
+
+        ingredients = ", ".join(pantry.ingredients)
+        await state.update_data(recipe_ingredients=ingredients)
+        await state.set_state(RecipeFlow.waiting_preference)
+        note = f"\n\n<i>{pantry.notes}</i>" if pantry.notes else ""
+        await message.answer(
+            f"На фото вижу: <b>{ingredients}</b>{note}\n\nЧто важнее?",
+            reply_markup=RECIPE_PREF_KB,
+        )
         return
-    await state.update_data(recipe_ingredients=message.text)
+
+    if not message.text:
+        await message.answer("Напиши список продуктов или отправь их фото 📸")
+        return
+
+    if is_photo_question(message.text):
+        await message.answer(
+            "Да 👍 Отправь фото продуктов, холодильника или того, что лежит на столе — "
+            "я попробую распознать продукты и предложу рецепты."
+        )
+        return
+
+    if looks_like_question(message.text):
+        await message.answer(
+            "Сейчас я жду именно список продуктов или их фото. "
+            "Например: <b>яйца, сыр, макароны, помидоры</b>.\n\n"
+            "Фото тоже можно отправить 📸"
+        )
+        return
+
+    ingredients = message.text.strip()
+    if len(ingredients) < 2:
+        await message.answer("Напиши хотя бы один продукт или отправь фото 📸")
+        return
+
+    await state.update_data(recipe_ingredients=ingredients)
     await state.set_state(RecipeFlow.waiting_preference)
     await message.answer("Что важнее?", reply_markup=RECIPE_PREF_KB)
 
