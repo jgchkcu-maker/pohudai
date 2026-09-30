@@ -35,15 +35,28 @@ async def send_daily_summary(bot: Bot) -> None:
             if not stats["foods"] and stats["km_walked"] is None:
                 continue
             km_text = "не указано" if stats["km_walked"] is None else f"{stats['km_walked']:.1f} км"
-            text = (
-                f"🧾 <b>Итоги дня</b>\n\n"
-                f"🍽 {stats['calories']} / {user.calorie_target} ккал\n"
-                f"🚶 {km_text}\n"
-                f"🔥 Оценочный расход: ~{stats['expenditure']} ккал\n"
-                f"📉 Расчётный баланс: {stats['deficit']:+} ккал\n"
-                f"🥩 Белок: {stats['protein']} г\n\n"
-                f"Хорошего вечера 👋"
-            )
+            if user.age < 18:
+                text = (
+                    f"🧾 <b>Итоги дня</b>\n\n"
+                    f"🍽 Записано: {stats['calories']} ккал\n"
+                    f"🎯 Дневной ориентир: ~{user.calorie_target} ккал\n"
+                    f"🚶 {km_text}\n"
+                    f"🔥 Оценочный расход: ~{stats['expenditure']} ккал\n"
+                    f"📉 Расчётный баланс: {stats['deficit']:+} ккал\n"
+                    f"🥩 Белок: {stats['protein']} г\n\n"
+                    "Ориентир не нужно специально добирать.\n"
+                    "Хорошего вечера 👋"
+                )
+            else:
+                text = (
+                    f"🧾 <b>Итоги дня</b>\n\n"
+                    f"🍽 {stats['calories']} / {user.calorie_target} ккал\n"
+                    f"🚶 {km_text}\n"
+                    f"🔥 Оценочный расход: ~{stats['expenditure']} ккал\n"
+                    f"📉 Расчётный баланс: {stats['deficit']:+} ккал\n"
+                    f"🥩 Белок: {stats['protein']} г\n\n"
+                    f"Хорошего вечера 👋"
+                )
             if stats["deficit"] > 900:
                 text += (
                     "\n\nСегодня получился очень большой расчётный дефицит. "
