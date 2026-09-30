@@ -14,6 +14,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from app.ai_service import FoodAnalysis, analyze_food_photo, analyze_food_text, analyze_pantry_photo, recipes
+from app.calculations import calculate_targets
 from app.db import SessionLocal
 from app.intents import is_photo_question, looks_like_question
 from app.keyboards import (
@@ -642,10 +643,30 @@ async def settings_target_save(message: Message, state: FSMContext) -> None:
         return
     async with SessionLocal() as session:
         user = await get_user(session, message.from_user.id)
+        if not user:
+            await state.clear()
+            return
         user.target_weight_kg = value
+        targets = calculate_targets(
+            user.sex,
+            user.age,
+            user.height_cm,
+            user.current_weight_kg,
+            user.activity_level,
+            user.goal,
+            user.target_weight_kg,
+        )
+        user.maintenance_calories = targets.maintenance
+        user.protein_target_g = targets.protein_g
+        if not user.calorie_target_manual:
+            user.calorie_target = targets.calories
         await session.commit()
     await state.clear()
-    await message.answer(f"Цель по весу изменена: <b>{value:.1f} кг</b>", reply_markup=MAIN_MENU)
+    await message.answer(
+        f"Цель по весу изменена: <b>{value:.1f} кг</b>\n"
+        f"Белковый ориентир: ~{user.protein_target_g} г/день",
+        reply_markup=MAIN_MENU,
+    )
 
 
 @router.callback_query(F.data.in_({"settings:evening", "settings:summary"}))
