@@ -3,13 +3,16 @@ from __future__ import annotations
 import base64
 import json
 
+from google import genai
+from google.genai import types
 from openai import AsyncOpenAI
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.config import settings
 
 
-client = AsyncOpenAI(api_key=settings.openai_api_key)
+openai_client = AsyncOpenAI(api_key=settings.openai_api_key) if settings.openai_api_key else None
+gemini_client = genai.Client(api_key=settings.gemini_api_key) if settings.gemini_api_key else None
 
 
 class StrictModel(BaseModel):
@@ -60,12 +63,16 @@ def _recipe_schema() -> dict:
     return RecipeSet.model_json_schema()
 
 
-async def _json_response(prompt: str, schema: dict, image_bytes: bytes | None = None) -> dict:
+async def _openai_json_response(prompt: str, schema: dict, image_bytes: bytes | None = None) -> dict:
+    if openai_client is None:
+        raise RuntimeError("OPENAI_API_KEY is not configured")
+
     content: list[dict] = [{"type": "input_text", "text": prompt}]
     if image_bytes is not None:
         data = base64.b64encode(image_bytes).decode("ascii")
         content.append({"type": "input_image", "image_url": f"data:image/jpeg;base64,{data}"})
-    response = await client.responses.create(
+
+    response = await openai_client.responses.create(
         model=settings.openai_model,
         input=[{"role": "user", "content": content}],
         text={
@@ -78,6 +85,46 @@ async def _json_response(prompt: str, schema: dict, image_bytes: bytes | None = 
         },
     )
     return json.loads(response.output_text)
+
+
+async def _gemini_json_response(prompt: str, schema: dict, image_bytes: bytes | None = None) -> dict:
+    if gemini_client is None:
+        raise RuntimeError("GEMINI_API_KEY is not configured")
+
+    contents: list[object] = [prompt]
+    if image_bytes is not None:
+        contents.append(types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"))
+
+    response = await gemini_client.aio.models.generate_content(
+        model=settings.gemini_model,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_json_schema=schema,
+        ),
+    )
+    if not response.text:
+        raise RuntimeError("Gemini returned an empty response")
+    return json.loads(response.text)
+
+
+async def _json_response(prompt: str, schema: dict, image_bytes: bytes | None = None) -> dict:
+    provider = settings.ai_provider.strip().lower()
+
+    if provider == "gemini":
+        return await _gemini_json_response(prompt, schema, image_bytes)
+
+    if provider == "openai":
+        return await _openai_json_response(prompt, schema, image_bytes)
+
+    if provider == "auto":
+        if gemini_client is not None:
+            return await _gemini_json_response(prompt, schema, image_bytes)
+        if openai_client is not None:
+            return await _openai_json_response(prompt, schema, image_bytes)
+        raise RuntimeError("Neither GEMINI_API_KEY nor OPENAI_API_KEY is configured")
+
+    raise RuntimeError(f"Unsupported AI_PROVIDER: {settings.ai_provider}")
 
 
 async def analyze_food_text(text: str, clarification: str | None = None) -> FoodAnalysis:
@@ -93,19 +140,26 @@ async def analyze_food_text(text: str, clarification: str | None = None) -> Food
     return FoodAnalysis.model_validate(await _json_response(prompt, _food_schema()))
 
 
-async def analyze_food_photo(image_bytes: bytes, clarification: str | None = None, assumed_total_grams: float | None = None) -> FoodAnalysis:
+async def analyze_food_photo(
+    image_bytes: bytes,
+    clarification: str | None = None,
+    assumed_total_grams: float | None = None,
+) -> FoodAnalysis:
     extra = ""
     if clarification:
         extra += f" Уточнение пользователя: {clarification}."
     if assumed_total_grams:
         extra += f" Общий вес блюда считать примерно {assumed_total_grams} г и распределить между компонентами."
+
     prompt = f"""
 Определи еду на фотографии для дневника питания.{extra}
 Перечисли видимые компоненты и оцени КБЖУ. Не притворяйся, что знаешь точный состав, масло, соусы или скрытые ингредиенты: отражай неопределённость в notes и confidence.
 Если общий вес не задан и по фото его нельзя надёжно знать, total_grams=null и needs_weight=true. Калории при этом дай как черновую оценку типичной видимой порции.
 Все числа — для всей порции.
 """
-    return FoodAnalysis.model_validate(await _json_response(prompt, _food_schema(), image_bytes=image_bytes))
+    return FoodAnalysis.model_validate(
+        await _json_response(prompt, _food_schema(), image_bytes=image_bytes)
+    )
 
 
 async def recipes(ingredients: str, preference: str, calories_left: int, protein_left: int) -> list[Recipe]:
