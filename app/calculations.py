@@ -53,7 +53,8 @@ def estimate_eer(sex: str, age: int, height_cm: float, weight_kg: float, activit
     table = YOUTH_EER if age <= 18 else ADULT_EER
     sex_table = table.get(sex, table["female"])
     intercept, age_coef, height_coef, weight_coef = sex_table.get(activity, sex_table["light"])
-    return intercept + age_coef * age + height_coef * height_cm + weight_coef * weight_kg
+    growth_allowance = 20.0 if age <= 18 else 0.0
+    return intercept + age_coef * age + height_coef * height_cm + weight_coef * weight_kg + growth_allowance
 
 
 def calculate_targets(
