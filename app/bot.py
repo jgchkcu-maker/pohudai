@@ -918,7 +918,11 @@ async def recipe_preference(callback: CallbackQuery, state: FSMContext) -> None:
     payload = [x.model_dump() for x in items]
     await state.update_data(recipes=payload, recipe_pref=pref)
     await state.set_state(RecipeFlow.choosing_recipe)
-    lines = [f"У тебя осталось примерно <b>{left} ккал</b>.\n"]
+    lines = (
+        [f"Дневной ориентир: ~<b>{user.calorie_target} ккал</b>. Подберу порцию с учётом уже записанной еды.\n"]
+        if user.age < 18
+        else [f"У тебя осталось примерно <b>{left} ккал</b>.\n"]
+    )
     for idx, item in enumerate(payload, 1):
         lines.append(f"<b>{idx}. {item['title']}</b>\n~{item['calories']} ккал · {item['protein_g']} г белка · {item['minutes']} мин\n")
     await callback.message.answer("\n".join(lines), reply_markup=recipe_choices(len(payload)))
@@ -998,7 +1002,14 @@ async def recipe_cooked(callback: CallbackQuery, state: FSMContext) -> None:
         await add_food(session, user, draft)
         stats = await day_stats(session, user, date.today())
     await state.clear()
-    text = f"Добавил блюдо в рацион ✅\nСегодня: {stats['calories']} / {user.calorie_target} ккал"
+    if user.age < 18:
+        text = (
+            f"Добавил блюдо в рацион ✅\nСегодня записано: {stats['calories']} ккал\n"
+            f"Дневной ориентир: ~{user.calorie_target} ккал\n"
+            "Ориентир не нужно специально добирать."
+        )
+    else:
+        text = f"Добавил блюдо в рацион ✅\nСегодня: {stats['calories']} / {user.calorie_target} ккал"
     await callback.message.answer(text, reply_markup=MAIN_MENU)
     await callback.answer()
 
