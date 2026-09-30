@@ -510,14 +510,37 @@ async def activity_km(message: Message, state: FSMContext) -> None:
         await message.answer("Введи километры числом, например: 6.5")
         return
     await state.update_data(km_walked=km, terrain="flat", pace="normal", workout_kcal=0.0)
+    async with SessionLocal() as session:
+        user = await get_user(session, message.from_user.id)
+        if not user:
+            await state.clear()
+            return
+        await upsert_activity(session, user, date.today(), km, "flat", "normal", 0.0)
     await state.set_state(ActivityFlow.waiting_terrain)
-    await message.answer("Какой был рельеф? Можно пропустить — тогда считаю ровным.", reply_markup=TERRAIN_KB)
+    await message.answer(
+        f"Записал ✅ {km:.1f} км\nКакой был рельеф? Можно пропустить — тогда считаю ровным.",
+        reply_markup=TERRAIN_KB,
+    )
 
 
 @router.callback_query(F.data.startswith("terrain:"))
 async def activity_terrain(callback: CallbackQuery, state: FSMContext) -> None:
     value = callback.data.split(":", 1)[1]
-    await state.update_data(terrain="flat" if value == "skip" else value)
+    terrain = "flat" if value == "skip" else value
+    await state.update_data(terrain=terrain)
+    data = await state.get_data()
+    async with SessionLocal() as session:
+        user = await get_user(session, callback.from_user.id)
+        if user:
+            await upsert_activity(
+                session,
+                user,
+                date.today(),
+                float(data.get("km_walked", 0.0)),
+                terrain,
+                data.get("pace", "normal"),
+                float(data.get("workout_kcal", 0.0)),
+            )
     await state.set_state(ActivityFlow.waiting_pace)
     await callback.message.edit_text("Какой был темп? Можно пропустить — тогда считаю обычным.", reply_markup=PACE_KB)
     await callback.answer()
@@ -526,7 +549,21 @@ async def activity_terrain(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data.startswith("pace:"))
 async def activity_pace(callback: CallbackQuery, state: FSMContext) -> None:
     value = callback.data.split(":", 1)[1]
-    await state.update_data(pace="normal" if value == "skip" else value)
+    pace = "normal" if value == "skip" else value
+    await state.update_data(pace=pace)
+    data = await state.get_data()
+    async with SessionLocal() as session:
+        user = await get_user(session, callback.from_user.id)
+        if user:
+            await upsert_activity(
+                session,
+                user,
+                date.today(),
+                float(data.get("km_walked", 0.0)),
+                data.get("terrain", "flat"),
+                pace,
+                float(data.get("workout_kcal", 0.0)),
+            )
     await callback.message.edit_text(
         "Была тренировка? Если часы/тренажёр показывают <b>активные</b> ккал — можно добавить их отдельно.",
         reply_markup=WORKOUT_KCAL_KB,
@@ -648,9 +685,11 @@ async def settings_calories_save(message: Message, state: FSMContext) -> None:
             await state.clear()
             return
         if user.age < 18:
+            await state.clear()
             await message.answer(
                 "Для пользователей младше 18 лет ручная калорийная цель отключена: "
-                "бот использует отдельный мягкий автоматический расчёт."
+                "бот использует отдельный мягкий автоматический расчёт.",
+                reply_markup=MAIN_MENU,
             )
             return
         user.calorie_target = int(value)
