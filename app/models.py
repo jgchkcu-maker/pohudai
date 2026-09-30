@@ -26,6 +26,7 @@ class User(Base):
     goal: Mapped[str] = mapped_column(String(16))
     maintenance_calories: Mapped[int] = mapped_column(Integer)
     calorie_target: Mapped[int] = mapped_column(Integer)
+    calorie_target_manual: Mapped[bool] = mapped_column(Boolean, default=False)
     protein_target_g: Mapped[int] = mapped_column(Integer)
     evening_poll_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     daily_summary_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
