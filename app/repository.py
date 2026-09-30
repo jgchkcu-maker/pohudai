@@ -36,6 +36,7 @@ async def create_user(session: AsyncSession, tg_id: int, name: str | None, data:
         goal=data["goal"],
         maintenance_calories=targets.maintenance,
         calorie_target=targets.calories,
+        calorie_target_manual=False,
         protein_target_g=targets.protein_g,
     )
     session.add(user)
@@ -47,6 +48,20 @@ async def create_user(session: AsyncSession, tg_id: int, name: str | None, data:
 
 async def add_weight(session: AsyncSession, user: User, weight_kg: float, measured_at: datetime | None = None) -> None:
     user.current_weight_kg = weight_kg
+    targets = calculate_targets(
+        user.sex,
+        user.age,
+        user.height_cm,
+        weight_kg,
+        user.activity_level,
+        user.goal,
+        user.target_weight_kg,
+    )
+    user.maintenance_calories = targets.maintenance
+    user.protein_target_g = targets.protein_g
+    if not user.calorie_target_manual:
+        user.calorie_target = targets.calories
+
     session.add(WeightEntry(user_id=user.id, measured_at=measured_at or datetime.now(), weight_kg=weight_kg))
     await session.commit()
 
