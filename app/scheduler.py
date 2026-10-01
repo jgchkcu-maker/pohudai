@@ -11,12 +11,15 @@ from app.db import SessionLocal
 from app.keyboards import MAIN_MENU
 from app.models import User
 from app.repository import day_stats, recalibrate_tdee
+from app.subscription import is_subscribed
 
 
 async def send_evening_poll(bot: Bot) -> None:
     async with SessionLocal() as session:
         users = list(await session.scalars(select(User).where(User.evening_poll_enabled.is_(True))))
     for user in users:
+        if not await is_subscribed(bot, user.tg_id):
+            continue
         try:
             await bot.send_message(
                 user.tg_id,
@@ -31,6 +34,8 @@ async def send_daily_summary(bot: Bot) -> None:
     async with SessionLocal() as session:
         users = list(await session.scalars(select(User).where(User.daily_summary_enabled.is_(True))))
         for user in users:
+            if not await is_subscribed(bot, user.tg_id):
+                continue
             stats = await day_stats(session, user, date.today())
             if not stats["foods"] and stats["km_walked"] is None:
                 continue
@@ -73,6 +78,8 @@ async def recalibrate_users(bot: Bot) -> None:
     async with SessionLocal() as session:
         users = list(await session.scalars(select(User)))
         for user in users:
+            if not await is_subscribed(bot, user.tg_id):
+                continue
             try:
                 report = await recalibrate_tdee(session, user)
                 if not report:
