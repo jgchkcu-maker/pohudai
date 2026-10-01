@@ -77,6 +77,17 @@ class WeightEntry(Base):
     user: Mapped["User"] = relationship(back_populates="weights")
 
 
+class NutritionCache(Base):
+    __tablename__ = "nutrition_cache"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    cache_key: Mapped[str] = mapped_column(String(512), unique=True, index=True)
+    query: Mapped[str] = mapped_column(String(512))
+    payload_json: Mapped[str] = mapped_column(Text)
+    source: Mapped[str] = mapped_column(String(255))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
 class ActivityEntry(Base):
     __tablename__ = "activity_entries"
     __table_args__ = (UniqueConstraint("user_id", "activity_date", name="uq_activity_user_day"),)
