@@ -21,8 +21,9 @@ gemini_client = genai.Client(api_key=settings.gemini_api_key) if settings.gemini
 logger = logging.getLogger(__name__)
 
 PHOTO_DETECT_TIMEOUT_SECONDS = 18
-PHOTO_SEARCH_TIMEOUT_SECONDS = 22
-PHOTO_FALLBACK_TIMEOUT_SECONDS = 10
+PHOTO_SEARCH_TIMEOUT_SECONDS = 18
+PHOTO_SEARCH_ATTEMPTS = 3
+PHOTO_SEARCH_RETRY_DELAYS_SECONDS = (2, 5)
 
 
 NUTRITION_COACH_SYSTEM = """
@@ -96,6 +97,10 @@ class NutritionReference(StrictModel):
 
 class NutritionReferenceBatch(StrictModel):
     items: list[NutritionReference]
+
+
+class NutritionSearchUnavailable(RuntimeError):
+    """Raised when nutrition could not be verified with actual Google Search grounding."""
 
 
 class Recipe(StrictModel):
@@ -316,35 +321,64 @@ async def _detect_food_photo(
     return PhotoFoodDetection.model_validate(payload)
 
 
-async def _estimate_photo_nutrition_without_search(
-    detection: PhotoFoodDetection,
-) -> NutritionReferenceBatch:
-    detected_json = json.dumps(
-        [item.model_dump() for item in detection.components],
-        ensure_ascii=False,
-    )
-    prompt = f"""
-Веб-поиск пищевой ценности не ответил вовремя. Ниже уже распознанные компоненты:
-{detected_json}
+def _response_field(value: object, *names: str):
+    for name in names:
+        if isinstance(value, dict) and name in value:
+            return value[name]
+        attr = getattr(value, name, None)
+        if attr is not None:
+            return attr
+    return None
 
-Дай резервную оценку пищевой ценности на 100 г для КАЖДОГО component_id.
-Это только fallback: не утверждай, что значения проверены по сайту или базе.
-Для брендированного товара используй типичный близкий аналог, если точных данных нет.
-Для обычной еды учитывай preparation.
-Верни ровно один результат на каждый component_id.
-В source обязательно пиши строку, начинающуюся с "fallback:".
-confidence не выше 0.55.
-"""
-    payload = await _gemini_json_response(
-        prompt,
-        _nutrition_reference_schema(),
+
+def _google_grounding_evidence(response) -> tuple[list[str], list[str]]:
+    candidates = getattr(response, "candidates", None) or []
+    if not candidates:
+        return [], []
+
+    metadata = _response_field(candidates[0], "grounding_metadata", "groundingMetadata")
+    if metadata is None:
+        return [], []
+
+    raw_queries = _response_field(metadata, "web_search_queries", "webSearchQueries") or []
+    queries = [str(query) for query in raw_queries if query]
+
+    raw_chunks = _response_field(metadata, "grounding_chunks", "groundingChunks") or []
+    sources: list[str] = []
+    seen: set[str] = set()
+    for chunk in raw_chunks:
+        web = _response_field(chunk, "web")
+        if web is None:
+            continue
+        uri = _response_field(web, "uri")
+        title = _response_field(web, "title")
+        source = str(title or uri or "").strip()
+        if source and source not in seen:
+            seen.add(source)
+            sources.append(source)
+
+    return queries, sources
+
+
+async def _gemini_grounded_json_response(prompt: str, schema: dict) -> tuple[dict, list[str], list[str]]:
+    if gemini_client is None:
+        raise RuntimeError("GEMINI_API_KEY is not configured")
+
+    config = types.GenerateContentConfig(
+        tools=[types.Tool(google_search=types.GoogleSearch())],
+        response_mime_type="application/json",
+        response_json_schema=schema,
     )
-    batch = NutritionReferenceBatch.model_validate(payload)
-    for item in batch.items:
-        item.confidence = min(item.confidence, 0.55)
-        if not item.source.startswith("fallback:"):
-            item.source = f"fallback: {item.source}"
-    return batch
+    response = await gemini_client.aio.models.generate_content(
+        model=settings.gemini_model,
+        contents=[prompt],
+        config=config,
+    )
+    if not response.text:
+        raise RuntimeError("Gemini returned an empty grounded response")
+
+    queries, sources = _google_grounding_evidence(response)
+    return json.loads(response.text), queries, sources
 
 
 async def _lookup_photo_nutrition(detection: PhotoFoodDetection) -> NutritionReferenceBatch:
@@ -356,47 +390,80 @@ async def _lookup_photo_nutrition(detection: PhotoFoodDetection) -> NutritionRef
 Это ВТОРОЙ этап анализа фотографии еды. Ниже уже распознанные визуальные компоненты:
 {detected_json}
 
-ОБЯЗАТЕЛЬНО используй Google Search, прежде чем возвращать пищевую ценность. Не отвечай только по памяти модели.
+Нужно ОБЯЗАТЕЛЬНО выполнить реальный Google Search перед ответом.
+Если поиск не дал результатов, не отвечай по памяти модели и не выдумывай КБЖУ.
+
 Для КАЖДОГО component_id найди максимально подходящие значения на 100 г готового продукта и верни ровно один результат с тем же component_id.
 
 Приоритет источников:
 1. официальный сайт производителя / официальная карточка конкретного брендированного товара;
-2. государственные и национальные базы состава продуктов (например USDA FoodData Central и аналоги);
-3. крупные надёжные базы продуктов или карточки крупных ритейлеров, если официального источника нет.
+2. государственные и национальные базы состава продуктов;
+3. крупные надёжные базы продуктов или карточки крупных ритейлеров.
 
 Правила:
-- для брендированного товара ищи именно указанный бренд и вариант, не подменяй похожим продуктом;
-- для обычной еды учитывай preparation из распознавания: варёный рис и сухой рис — разные значения;
-- для ресторанного/составного блюда без точного рецепта используй наиболее близкий типичный готовый аналог и снижай confidence;
-- нормализуй значения к 100 г; для напитка допустимо использовать значения на 100 мл как практический эквивалент, если источник даёт только их;
+- для брендированного товара ищи именно указанный бренд и вариант;
+- для обычной еды учитывай preparation: варёный и сухой продукт — не одно и то же;
+- если точного брендированного продукта в поиске нет, используй наиболее близкий найденный аналог только при явной необходимости и снижай confidence;
+- нормализуй значения к 100 г;
 - не используй estimated_grams при выборе значений на 100 г;
-- source укажи кратко: домен/название источника или конкретной страницы;
-- не пропускай компоненты. Если точный источник не найден, используй лучший надёжный типичный аналог и честно снизь confidence.
+- source укажи кратко, но итоговое приложение всё равно проверит наличие реального grounding metadata;
+- не пропускай component_id.
 """
-    try:
-        payload = await asyncio.wait_for(
-            _gemini_json_response(
-                prompt,
-                _nutrition_reference_schema(),
-                use_google_search=True,
-            ),
-            timeout=PHOTO_SEARCH_TIMEOUT_SECONDS,
-        )
-        return NutritionReferenceBatch.model_validate(payload)
-    except Exception as exc:
-        logger.warning(
-            "Photo nutrition web lookup failed; using bounded fallback: %s",
-            exc,
-            exc_info=True,
-        )
-        try:
-            return await asyncio.wait_for(
-                _estimate_photo_nutrition_without_search(detection),
-                timeout=PHOTO_FALLBACK_TIMEOUT_SECONDS,
-            )
-        except TimeoutError as fallback_exc:
-            raise RuntimeError("Photo nutrition fallback timed out") from fallback_exc
 
+    last_error: Exception | None = None
+
+    for attempt in range(PHOTO_SEARCH_ATTEMPTS):
+        if attempt:
+            delay = PHOTO_SEARCH_RETRY_DELAYS_SECONDS[attempt - 1]
+            await asyncio.sleep(delay)
+
+        try:
+            payload, queries, sources = await asyncio.wait_for(
+                _gemini_grounded_json_response(
+                    prompt,
+                    _nutrition_reference_schema(),
+                ),
+                timeout=PHOTO_SEARCH_TIMEOUT_SECONDS,
+            )
+
+            if not queries or not sources:
+                raise NutritionSearchUnavailable(
+                    "Gemini response had no Google Search grounding evidence"
+                )
+
+            batch = NutritionReferenceBatch.model_validate(payload)
+            expected_ids = {item.component_id for item in detection.components}
+            returned_ids = {item.component_id for item in batch.items}
+            if expected_ids != returned_ids:
+                raise NutritionSearchUnavailable(
+                    f"Grounded search returned incomplete component ids: expected={expected_ids}, got={returned_ids}"
+                )
+
+            verified_sources = ", ".join(sources[:4])
+            for item in batch.items:
+                item.source = f"Google Search: {verified_sources}"
+
+            logger.info(
+                "Photo nutrition grounded search succeeded: attempt=%s queries=%s sources=%s",
+                attempt + 1,
+                queries,
+                sources[:4],
+            )
+            return batch
+
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "Photo nutrition grounded search attempt %s/%s failed: %s",
+                attempt + 1,
+                PHOTO_SEARCH_ATTEMPTS,
+                exc,
+                exc_info=True,
+            )
+
+    raise NutritionSearchUnavailable(
+        "Не удалось подтвердить КБЖУ через Google Search после нескольких попыток"
+    ) from last_error
 
 def _compose_photo_food_analysis(
     detection: PhotoFoodDetection,
@@ -461,20 +528,10 @@ def _compose_photo_food_analysis(
     notes: list[str] = []
     if detection.notes:
         notes.append(detection.notes)
-    used_fallback = any(item.source.startswith("fallback:") for item in nutrition.items)
-    if used_fallback:
-        if assumed_total_grams is None:
-            notes.append(
-                "Веб-поиск КБЖУ не ответил вовремя; показана резервная оценка модели, а вес порции по фото приблизительный."
-            )
-        else:
-            notes.append(
-                "Веб-поиск КБЖУ не ответил вовремя; резервная оценка модели пересчитана на указанный общий вес."
-            )
-    elif assumed_total_grams is None:
-        notes.append("КБЖУ компонентов проверены через веб-поиск; вес порции по фото пока приблизительный.")
+    if assumed_total_grams is None:
+        notes.append("КБЖУ подтверждены реальным Google Search; вес порции по фото пока приблизительный.")
     else:
-        notes.append("КБЖУ компонентов проверены через веб-поиск и пересчитаны на указанный общий вес.")
+        notes.append("КБЖУ подтверждены реальным Google Search и пересчитаны на указанный общий вес.")
     if unresolved:
         notes.append("Не удалось надёжно подобрать пищевую ценность для: " + ", ".join(unresolved) + ".")
 
