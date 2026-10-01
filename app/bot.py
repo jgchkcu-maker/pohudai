@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import calendar
 import json
+import logging
 import re
 from datetime import date, datetime, timedelta
 from io import BytesIO
@@ -45,6 +47,7 @@ from app.repository import (
 
 
 router = Router(name="pohudai")
+logger = logging.getLogger(__name__)
 
 
 class Onboarding(StatesGroup):
@@ -370,10 +373,35 @@ async def food_hint(callback: CallbackQuery, state: FSMContext) -> None:
 
 async def _analyze_message_food(message: Message, state: FSMContext) -> None:
     if message.photo:
-        await message.answer("Смотрю, что на фото…")
+        status = await message.answer("Смотрю, что на фото…")
         file_id = message.photo[-1].file_id
-        image = await _get_image(message.bot, file_id)
-        analysis = await analyze_food_photo(image)
+        try:
+            image = await _get_image(message.bot, file_id)
+            analysis_task = asyncio.create_task(analyze_food_photo(image))
+            try:
+                analysis = await asyncio.wait_for(asyncio.shield(analysis_task), timeout=7)
+            except asyncio.TimeoutError:
+                await status.edit_text("Распознаю продукты и сверяю КБЖУ в интернете…")
+                try:
+                    analysis = await asyncio.wait_for(analysis_task, timeout=46)
+                except asyncio.TimeoutError:
+                    analysis_task.cancel()
+                    await status.edit_text(
+                        "Поиск КБЖУ слишком долго не отвечает. Попробуй отправить фото ещё раз или напиши продукт текстом."
+                    )
+                    return
+        except Exception:
+            logger.exception("Photo food analysis failed")
+            await status.edit_text(
+                "Не получилось обработать фото. Попробуй ещё раз — теперь бот не будет молча висеть при ошибке."
+            )
+            return
+
+        try:
+            await status.delete()
+        except Exception:
+            pass
+
         draft = _draft(analysis, "photo")
         await state.update_data(food_draft=draft, food_original_file_id=file_id, food_source="photo")
         await state.set_state(FoodFlow.waiting_confirm)
