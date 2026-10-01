@@ -17,6 +17,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from app.ai_service import (
     FoodAnalysis,
+    NutritionSearchQuotaExceeded,
     NutritionSearchUnavailable,
     analyze_food_photo,
     analyze_food_text,
@@ -405,11 +406,19 @@ async def _analyze_message_food(message: Message, state: FSMContext) -> None:
                         "Google Search слишком долго не отвечает. Я не буду придумывать КБЖУ без источников — отправь фото ещё раз."
                     )
                     return
+        except NutritionSearchQuotaExceeded:
+            logger.error("Google Search quota/billing blocked photo nutrition lookup", exc_info=True)
+            await status.edit_text(
+                "Google Search сейчас отклоняет запросы по квоте API (429). "
+                "Для обязательного поиска нужно включить billing/доступ к Google Search для этого Gemini API ключа. "
+                "КБЖУ из памяти модели я не подставляю."
+            )
+            return
         except NutritionSearchUnavailable:
             logger.warning("Photo nutrition could not be verified with Google Search", exc_info=True)
             await status.edit_text(
-                "Не удалось подтвердить КБЖУ через Google Search после нескольких попыток. "
-                "Я не стал подставлять оценку из памяти модели. Попробуй отправить фото ещё раз или уточни название продукта."
+                "Google Search не смог вернуть подтверждённые КБЖУ. "
+                "Я не стал подставлять оценку из памяти модели. Попробуй ещё раз или уточни точное название продукта."
             )
             return
         except Exception:
