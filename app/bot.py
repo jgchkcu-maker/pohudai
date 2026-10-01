@@ -15,7 +15,14 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from app.ai_service import FoodAnalysis, analyze_food_photo, analyze_food_text, analyze_pantry_photo, recipes
+from app.ai_service import (
+    FoodAnalysis,
+    NutritionSearchUnavailable,
+    analyze_food_photo,
+    analyze_food_text,
+    analyze_pantry_photo,
+    recipes,
+)
 from app.calculations import DailyLog, calculate_targets
 from app.db import SessionLocal
 from app.intents import is_photo_question, looks_like_question
@@ -108,10 +115,18 @@ def _format_food(draft: dict, include_components: bool = False) -> str:
     ])
     if include_components and draft.get("components"):
         lines.append("\nЯ распознал:")
+        verified_sources: list[str] = []
         for item in draft["components"]:
             brand = f" {item['brand']}" if item.get("brand") else ""
             grams = f" — ~{item['grams']:.0f} г" if item.get("grams") else ""
             lines.append(f"• {item['name']}{brand}{grams}")
+            source = item.get("nutrition_source")
+            if source and source not in verified_sources:
+                verified_sources.append(source)
+        if verified_sources:
+            lines.append("\n🌐 <b>Проверено через Google Search</b>")
+            for source in verified_sources[:3]:
+                lines.append(f"• {source}")
     if draft.get("notes"):
         lines.append(f"\n<i>{draft['notes']}</i>")
     return "\n".join(lines)
@@ -381,19 +396,26 @@ async def _analyze_message_food(message: Message, state: FSMContext) -> None:
             try:
                 analysis = await asyncio.wait_for(asyncio.shield(analysis_task), timeout=7)
             except asyncio.TimeoutError:
-                await status.edit_text("Распознаю продукты и сверяю КБЖУ в интернете…")
+                await status.edit_text("Распознал фото. Теперь обязательно ищу и проверяю КБЖУ через Google Search…")
                 try:
-                    analysis = await asyncio.wait_for(analysis_task, timeout=46)
+                    analysis = await asyncio.wait_for(analysis_task, timeout=82)
                 except asyncio.TimeoutError:
                     analysis_task.cancel()
                     await status.edit_text(
-                        "Поиск КБЖУ слишком долго не отвечает. Попробуй отправить фото ещё раз или напиши продукт текстом."
+                        "Google Search слишком долго не отвечает. Я не буду придумывать КБЖУ без источников — отправь фото ещё раз."
                     )
                     return
+        except NutritionSearchUnavailable:
+            logger.warning("Photo nutrition could not be verified with Google Search", exc_info=True)
+            await status.edit_text(
+                "Не удалось подтвердить КБЖУ через Google Search после нескольких попыток. "
+                "Я не стал подставлять оценку из памяти модели. Попробуй отправить фото ещё раз или уточни название продукта."
+            )
+            return
         except Exception:
             logger.exception("Photo food analysis failed")
             await status.edit_text(
-                "Не получилось обработать фото. Попробуй ещё раз — теперь бот не будет молча висеть при ошибке."
+                "Не получилось обработать фото. Попробуй ещё раз."
             )
             return
 
