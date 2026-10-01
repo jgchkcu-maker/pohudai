@@ -12,6 +12,15 @@ class Settings(BaseSettings):
     gemini_api_key: str | None = None
     gemini_model: str = "gemini-3.5-flash-lite"
 
+    # Nutrition data providers. Open Food Facts works without credentials.
+    fatsecret_client_id: str | None = None
+    fatsecret_client_secret: str | None = None
+    usda_api_key: str | None = None
+    serper_api_key: str | None = None
+    nutrition_region: str = "RU"
+    nutrition_language: str = "ru"
+    nutrition_cache_days: int = 30
+
     database_url: str = "sqlite+aiosqlite:///./pohudai.db"
     app_timezone: str = "Europe/Moscow"
     evening_poll_hour: int = 20
