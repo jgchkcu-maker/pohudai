@@ -82,6 +82,25 @@ jobs:
               "required": ["items"],
           }
 
+          print("\n=== TEST 0: gemini-3.5-flash-lite without Google Search ===")
+          try:
+              resp = run_with_timeout(15, lambda: client.models.generate_content(
+                  model=model,
+                  contents=["Return JSON with {\\\"ok\\\": true}."],
+                  config=types.GenerateContentConfig(
+                      response_mime_type="application/json",
+                      response_json_schema={
+                          "type": "object",
+                          "properties": {"ok": {"type": "boolean"}},
+                          "required": ["ok"],
+                      },
+                  ),
+              ))
+              print("plain response:", (resp.text or "")[:500])
+          except Exception as exc:
+              print("PLAIN EXCEPTION:", repr(exc))
+              traceback.print_exc()
+
           def dump_grounding(resp):
               candidates = getattr(resp, "candidates", None) or []
               if not candidates:
@@ -138,6 +157,23 @@ jobs:
                           print("step repr:", repr(step)[:5000])
           except Exception as exc:
               print("EXCEPTION:", repr(exc))
+              traceback.print_exc()
+
+          print("\n=== TEST 2.5: gemini-2.5-flash-lite + Google Search + structured output ===")
+          try:
+              resp25 = run_with_timeout(25, lambda: client.models.generate_content(
+                  model="gemini-2.5-flash-lite",
+                  contents=[prompt],
+                  config=types.GenerateContentConfig(
+                      tools=[types.Tool(google_search=types.GoogleSearch())],
+                      response_mime_type="application/json",
+                      response_json_schema=schema,
+                  ),
+              ))
+              print("2.5 text:", (resp25.text or "")[:3000])
+              dump_grounding(resp25)
+          except Exception as exc:
+              print("2.5 EXCEPTION:", repr(exc))
               traceback.print_exc()
 
           print("\n=== TEST 3: Interactions ANY + search + structured output ===")
