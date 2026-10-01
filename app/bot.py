@@ -125,7 +125,7 @@ def _format_food(draft: dict, include_components: bool = False) -> str:
             if source and source not in verified_sources:
                 verified_sources.append(source)
         if verified_sources:
-            lines.append("\n🌐 <b>Проверено через Google Search</b>")
+            lines.append("\n🌐 <b>Источники КБЖУ</b>")
             for source in verified_sources[:3]:
                 lines.append(f"• {source}")
     if draft.get("notes"):
@@ -397,13 +397,13 @@ async def _analyze_message_food(message: Message, state: FSMContext) -> None:
             try:
                 analysis = await asyncio.wait_for(asyncio.shield(analysis_task), timeout=7)
             except asyncio.TimeoutError:
-                await status.edit_text("Распознал фото. Теперь обязательно ищу и проверяю КБЖУ через Google Search…")
+                await status.edit_text("Распознал фото. Ищу КБЖУ в базах продуктов и веб-источниках…")
                 try:
-                    analysis = await asyncio.wait_for(analysis_task, timeout=82)
+                    analysis = await asyncio.wait_for(analysis_task, timeout=100)
                 except asyncio.TimeoutError:
                     analysis_task.cancel()
                     await status.edit_text(
-                        "Google Search слишком долго не отвечает. Я не буду придумывать КБЖУ без источников — отправь фото ещё раз."
+                        "Источники КБЖУ слишком долго не отвечают. Я не буду придумывать значения без источников — отправь фото ещё раз."
                     )
                     return
         except NutritionSearchQuotaExceeded:
@@ -417,7 +417,7 @@ async def _analyze_message_food(message: Message, state: FSMContext) -> None:
         except NutritionSearchUnavailable:
             logger.warning("Photo nutrition could not be verified with Google Search", exc_info=True)
             await status.edit_text(
-                "Google Search не смог вернуть подтверждённые КБЖУ. "
+                "Не удалось найти подтверждённые КБЖУ в доступных базах и веб-источниках. "
                 "Я не стал подставлять оценку из памяти модели. Попробуй ещё раз или уточни точное название продукта."
             )
             return
