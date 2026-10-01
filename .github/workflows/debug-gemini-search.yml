@@ -27,6 +27,7 @@ jobs:
           import os
           import traceback
           import importlib.metadata
+          import signal
           from google import genai
           from google.genai import types
 
@@ -35,6 +36,17 @@ jobs:
 
           client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
           model = "gemini-3.5-flash-lite"
+
+          def run_with_timeout(seconds, fn):
+              def handler(signum, frame):
+                  raise TimeoutError(f"diagnostic call exceeded {seconds}s")
+              old = signal.signal(signal.SIGALRM, handler)
+              signal.alarm(seconds)
+              try:
+                  return fn()
+              finally:
+                  signal.alarm(0)
+                  signal.signal(signal.SIGALRM, old)
           prompt = """
           Сначала ОБЯЗАТЕЛЬНО выполни Google Search. Не отвечай по памяти.
           Найди пищевую ценность на 100 г для продукта "Соус Цезарь Смик".
@@ -88,7 +100,7 @@ jobs:
 
           print("\n=== TEST 1: generateContent + search + structured output (current app path) ===")
           try:
-              resp = client.models.generate_content(
+              resp = run_with_timeout(25, lambda: client.models.generate_content(
                   model=model,
                   contents=[prompt],
                   config=types.GenerateContentConfig(
@@ -96,7 +108,7 @@ jobs:
                       response_mime_type="application/json",
                       response_json_schema=schema,
                   ),
-              )
+              ))
               print("text:", (resp.text or "")[:3000])
               dump_grounding(resp)
           except Exception as exc:
@@ -105,7 +117,7 @@ jobs:
 
           print("\n=== TEST 2: Interactions AUTO + search + structured output ===")
           try:
-              interaction = client.interactions.create(
+              interaction = run_with_timeout(25, lambda: client.interactions.create(
                   model=model,
                   input=prompt,
                   tools=[{"type": "google_search"}],
@@ -114,7 +126,7 @@ jobs:
                       "mime_type": "application/json",
                       "schema": schema,
                   },
-              )
+              ))
               print("output_text:", (getattr(interaction, "output_text", None) or "")[:3000])
               steps = getattr(interaction, "steps", None) or []
               print("step types:", [getattr(step, "type", None) for step in steps])
@@ -130,7 +142,7 @@ jobs:
 
           print("\n=== TEST 3: Interactions ANY + search + structured output ===")
           try:
-              interaction = client.interactions.create(
+              interaction = run_with_timeout(25, lambda: client.interactions.create(
                   model=model,
                   input=prompt,
                   tools=[{"type": "google_search"}],
@@ -140,7 +152,7 @@ jobs:
                       "mime_type": "application/json",
                       "schema": schema,
                   },
-              )
+              ))
               print("output_text:", (getattr(interaction, "output_text", None) or "")[:3000])
               steps = getattr(interaction, "steps", None) or []
               print("step types:", [getattr(step, "type", None) for step in steps])
