@@ -44,6 +44,13 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           AI_PROVIDER: gemini
           GEMINI_MODEL: gemini-3.5-flash-lite
+          FATSECRET_CLIENT_ID: ${{ secrets.FATSECRET_CLIENT_ID }}
+          FATSECRET_CLIENT_SECRET: ${{ secrets.FATSECRET_CLIENT_SECRET }}
+          USDA_API_KEY: ${{ secrets.USDA_API_KEY }}
+          SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
+          NUTRITION_REGION: RU
+          NUTRITION_LANGUAGE: ru
+          NUTRITION_CACHE_DAYS: 30
           DATABASE_URL: sqlite+aiosqlite:///./pohudai.db
           APP_TIMEZONE: Europe/Amsterdam
         run: python -m app.main
