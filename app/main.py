@@ -13,6 +13,7 @@ from app.scheduler import build_scheduler
 from app.subscription import SubscriptionMiddleware
 
 
+# Deployment entrypoint for the long-running Telegram polling process.
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     await init_db()
