@@ -219,19 +219,18 @@ async def _gemini_json_response(
         contents.append(types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"))
 
     if use_google_search:
-        # Gemini 3 structured output + built-in tools uses response_format.
-        # A plain dict keeps this compatible with the current google-genai API shape.
-        config = {
-            "tools": [{"google_search": {}}],
-            "response_format": {
-                "text": {
-                    "mime_type": "application/json",
-                    "schema": schema,
-                }
-            },
-        }
-        if system_instruction:
-            config["system_instruction"] = system_instruction
+        # Use the native GenerateContentConfig shape for the google-genai SDK.
+        # Gemini 3.x supports Google Search grounding together with structured JSON output.
+        config = types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            tools=[
+                types.Tool(
+                    google_search=types.GoogleSearch(),
+                )
+            ],
+            response_mime_type="application/json",
+            response_json_schema=schema,
+        )
     else:
         config = types.GenerateContentConfig(
             system_instruction=system_instruction,
