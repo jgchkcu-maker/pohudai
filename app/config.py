@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     evening_poll_hour: int = 20
     daily_summary_hour: int = 22
 
+    required_channel: str = "@ophudAI"
+    required_channel_url: str = "https://t.me/ophudAI"
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
 
