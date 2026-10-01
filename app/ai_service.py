@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
+import logging
 from collections import OrderedDict
 
 from google import genai
@@ -15,6 +17,12 @@ from app.config import settings
 
 openai_client = AsyncOpenAI(api_key=settings.openai_api_key) if settings.openai_api_key else None
 gemini_client = genai.Client(api_key=settings.gemini_api_key) if settings.gemini_api_key else None
+
+logger = logging.getLogger(__name__)
+
+PHOTO_DETECT_TIMEOUT_SECONDS = 18
+PHOTO_SEARCH_TIMEOUT_SECONDS = 22
+PHOTO_FALLBACK_TIMEOUT_SECONDS = 10
 
 
 NUTRITION_COACH_SYSTEM = """
@@ -295,13 +303,49 @@ async def _detect_food_photo(
 
 Не считай и не возвращай калории, белки, жиры или углеводы.
 """
-    return PhotoFoodDetection.model_validate(
-        await _gemini_json_response(
-            prompt,
-            _photo_detection_schema(),
-            image_bytes=image_bytes,
+    try:
+        payload = await asyncio.wait_for(
+            _gemini_json_response(
+                prompt,
+                _photo_detection_schema(),
+                image_bytes=image_bytes,
+            ),
+            timeout=PHOTO_DETECT_TIMEOUT_SECONDS,
         )
+    except TimeoutError as exc:
+        raise RuntimeError("Photo recognition timed out") from exc
+    return PhotoFoodDetection.model_validate(payload)
+
+
+async def _estimate_photo_nutrition_without_search(
+    detection: PhotoFoodDetection,
+) -> NutritionReferenceBatch:
+    detected_json = json.dumps(
+        [item.model_dump() for item in detection.components],
+        ensure_ascii=False,
     )
+    prompt = f"""
+Веб-поиск пищевой ценности не ответил вовремя. Ниже уже распознанные компоненты:
+{detected_json}
+
+Дай резервную оценку пищевой ценности на 100 г для КАЖДОГО component_id.
+Это только fallback: не утверждай, что значения проверены по сайту или базе.
+Для брендированного товара используй типичный близкий аналог, если точных данных нет.
+Для обычной еды учитывай preparation.
+Верни ровно один результат на каждый component_id.
+В source обязательно пиши строку, начинающуюся с "fallback:".
+confidence не выше 0.55.
+"""
+    payload = await _gemini_json_response(
+        prompt,
+        _nutrition_reference_schema(),
+    )
+    batch = NutritionReferenceBatch.model_validate(payload)
+    for item in batch.items:
+        item.confidence = min(item.confidence, 0.55)
+        if not item.source.startswith("fallback:"):
+            item.source = f"fallback: {item.source}"
+    return batch
 
 
 async def _lookup_photo_nutrition(detection: PhotoFoodDetection) -> NutritionReferenceBatch:
@@ -330,13 +374,29 @@ async def _lookup_photo_nutrition(detection: PhotoFoodDetection) -> NutritionRef
 - source укажи кратко: домен/название источника или конкретной страницы;
 - не пропускай компоненты. Если точный источник не найден, используй лучший надёжный типичный аналог и честно снизь confidence.
 """
-    return NutritionReferenceBatch.model_validate(
-        await _gemini_json_response(
-            prompt,
-            _nutrition_reference_schema(),
-            use_google_search=True,
+    try:
+        payload = await asyncio.wait_for(
+            _gemini_json_response(
+                prompt,
+                _nutrition_reference_schema(),
+                use_google_search=True,
+            ),
+            timeout=PHOTO_SEARCH_TIMEOUT_SECONDS,
         )
-    )
+        return NutritionReferenceBatch.model_validate(payload)
+    except Exception as exc:
+        logger.warning(
+            "Photo nutrition web lookup failed; using bounded fallback: %s",
+            exc,
+            exc_info=True,
+        )
+        try:
+            return await asyncio.wait_for(
+                _estimate_photo_nutrition_without_search(detection),
+                timeout=PHOTO_FALLBACK_TIMEOUT_SECONDS,
+            )
+        except TimeoutError as fallback_exc:
+            raise RuntimeError("Photo nutrition fallback timed out") from fallback_exc
 
 
 def _compose_photo_food_analysis(
@@ -402,7 +462,17 @@ def _compose_photo_food_analysis(
     notes: list[str] = []
     if detection.notes:
         notes.append(detection.notes)
-    if assumed_total_grams is None:
+    used_fallback = any(item.source.startswith("fallback:") for item in nutrition.items)
+    if used_fallback:
+        if assumed_total_grams is None:
+            notes.append(
+                "Веб-поиск КБЖУ не ответил вовремя; показана резервная оценка модели, а вес порции по фото приблизительный."
+            )
+        else:
+            notes.append(
+                "Веб-поиск КБЖУ не ответил вовремя; резервная оценка модели пересчитана на указанный общий вес."
+            )
+    elif assumed_total_grams is None:
         notes.append("КБЖУ компонентов проверены через веб-поиск; вес порции по фото пока приблизительный.")
     else:
         notes.append("КБЖУ компонентов проверены через веб-поиск и пересчитаны на указанный общий вес.")
