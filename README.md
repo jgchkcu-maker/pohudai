@@ -19,18 +19,21 @@ Telegram-бот для простого ведения питания, акти�
 - вечерний опрос и итог дня, которые можно отключить;
 - SQLite из коробки, PostgreSQL через `DATABASE_URL`.
 
-AI используется как оценщик, поэтому калории и КБЖУ для фото остаются приблизительными. Перед сохранением еда подтверждается пользователем. Для брендовых продуктов модель не должна изображать поиск по официальной базе, если данных упаковки/этикетки нет.
+Для фото используется двухэтапный пайплайн: Gemini распознаёт продукты, затем бот ищет КБЖУ во внешних источниках. Сначала используются Open Food Facts, FatSecret RU (если заданы ключи) и USDA FoodData Central (если задан ключ). Если точного совпадения нет, можно подключить Google SERP через Serper. Только если внешние источники ничего не дали, остаётся строгий Gemini Google Search fallback. Найденные КБЖУ кешируются в базе на 30 дней.
+
+Перед сохранением еда подтверждается пользователем. Бот не должен подставлять КБЖУ из памяти модели, если внешний источник не найден.
 
 ## Запуск
 
-Нужны Python 3.12+, токен Telegram-бота и OpenAI API key.
+Нужны Python 3.12+, токен Telegram-бота и Gemini API key. Open Food Facts работает без ключа. FatSecret, USDA и Serper подключаются отдельными переменными окружения.
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-# заполнить BOT_TOKEN и OPENAI_API_KEY
+# заполнить BOT_TOKEN и GEMINI_API_KEY
+# опционально: FATSECRET_CLIENT_ID/FATSECRET_CLIENT_SECRET, USDA_API_KEY, SERPER_API_KEY
 python -m app.main
 ```
 
@@ -56,7 +59,8 @@ DATABASE_URL=postgresql+asyncpg://user:password@host:5432/pohudai
 ## Архитектура
 
 - `app/bot.py` — Telegram UX и FSM-сценарии;
-- `app/ai_service.py` — распознавание еды и рецепты через OpenAI Responses API;
+- `app/ai_service.py` — AI-распознавание еды, выбор подтверждённых КБЖУ и рецепты;
+- `app/nutrition_sources.py` — Open Food Facts, FatSecret, USDA, Serper и persistent cache;
 - `app/models.py` — пользователи, еда, вес, активность;
 - `app/repository.py` — запись и агрегирование дневника;
 - `app/calculations.py` — норма и оценочный расход;
@@ -67,8 +71,8 @@ DATABASE_URL=postgresql+asyncpg://user:password@host:5432/pohudai
 
 1. Alembic-миграции и PostgreSQL по умолчанию для продакшна.
 2. Redis для FSM при нескольких инстансах.
-3. Open Food Facts / своя база продуктов для точных брендовых позиций.
+3. Сканирование штрихкодов и точная идентификация товара по EAN/GTIN.
 4. Любимые блюда и «повторить вчерашний завтрак».
-5. Фото холодильника, голос, штрихкоды и меню ресторана.
+5. Фото холодильника, голос и меню ресторана.
 6. Персонализация расхода по нескольким неделям фактических шагов и динамике веса.
-7. Интеграционные тесты Telegram- и AI-сценариев.
+7. Интеграционные тесты внешних nutrition API и Telegram-сценариев.
