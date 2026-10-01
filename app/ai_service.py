@@ -13,6 +13,12 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.config import settings
+from app.nutrition_sources import (
+    collect_nutrition_evidence,
+    load_cached_nutrition,
+    nutrition_lookup_key,
+    save_cached_nutrition,
+)
 
 
 openai_client = AsyncOpenAI(api_key=settings.openai_api_key) if settings.openai_api_key else None
@@ -100,7 +106,7 @@ class NutritionReferenceBatch(StrictModel):
 
 
 class NutritionSearchUnavailable(RuntimeError):
-    """Raised when nutrition could not be verified with actual Google Search grounding."""
+    """Raised when nutrition could not be verified from external sources."""
 
 
 class NutritionSearchQuotaExceeded(NutritionSearchUnavailable):
@@ -413,7 +419,7 @@ async def _gemini_forced_google_search_json(
     return json.loads(output_text), queries, successful_results
 
 
-async def _lookup_photo_nutrition(detection: PhotoFoodDetection) -> NutritionReferenceBatch:
+async def _lookup_photo_nutrition_google(detection: PhotoFoodDetection) -> NutritionReferenceBatch:
     detected_json = json.dumps(
         [item.model_dump() for item in detection.components],
         ensure_ascii=False,
@@ -514,6 +520,203 @@ async def _lookup_photo_nutrition(detection: PhotoFoodDetection) -> NutritionRef
         "Не удалось получить подтверждённые КБЖУ через принудительный Google Search"
     ) from last_error
 
+
+async def _select_nutrition_from_evidence(
+    components: list[PhotoFoodComponent],
+    evidence_by_component: dict[str, list[dict]],
+) -> NutritionReferenceBatch:
+    evidence_payload: dict[str, list[dict]] = {}
+    evidence_index: dict[str, dict] = {}
+
+    for component in components:
+        rows: list[dict] = []
+        for candidate in evidence_by_component.get(component.component_id, []):
+            row = dict(candidate)
+            local_id = str(row.get("evidence_id") or "e")
+            evidence_id = f"{component.component_id}:{local_id}"
+            row["evidence_id"] = evidence_id
+            evidence_index[evidence_id] = row
+            rows.append(row)
+        evidence_payload[component.component_id] = rows
+
+    if not any(evidence_payload.values()):
+        return NutritionReferenceBatch(items=[])
+
+    detected_json = json.dumps(
+        [item.model_dump() for item in components],
+        ensure_ascii=False,
+    )
+    evidence_json = json.dumps(evidence_payload, ensure_ascii=False)
+
+    prompt = f"""
+Ты выбираешь КБЖУ ТОЛЬКО из внешних источников, уже полученных приложением.
+
+Распознанные компоненты:
+{detected_json}
+
+Кандидаты из Open Food Facts / FatSecret / USDA / веб-поиска:
+{evidence_json}
+
+Правила:
+- верни только те component_id, для которых есть достаточно надёжный кандидат;
+- source ОБЯЗАТЕЛЬНО должен быть ТОЧНО равен evidence_id выбранного кандидата;
+- для кандидатов, где уже есть calories_100g/protein_g_100g/fat_g_100g/carbs_g_100g, не меняй эти значения;
+- для веб-кандидата без структурированных полей разрешено извлечь КБЖУ только если они явно написаны в title/snippet;
+- если хотя бы одно из четырёх значений нельзя подтвердить из evidence, пропусти component_id;
+- для брендированного продукта не подменяй его другим брендом без явного снижения confidence;
+- не используй знания модели и ничего не додумывай.
+"""
+
+    payload = await _gemini_json_response(
+        prompt,
+        _nutrition_reference_schema(),
+    )
+    proposed = NutritionReferenceBatch.model_validate(payload)
+
+    accepted: list[NutritionReference] = []
+    seen_ids: set[str] = set()
+    allowed_component_ids = {item.component_id for item in components}
+
+    for item in proposed.items:
+        if item.component_id not in allowed_component_ids or item.component_id in seen_ids:
+            continue
+        evidence = evidence_index.get(item.source)
+        if evidence is None:
+            continue
+
+        direct_values = all(
+            evidence.get(field) is not None
+            for field in (
+                "calories_100g",
+                "protein_g_100g",
+                "fat_g_100g",
+                "carbs_g_100g",
+            )
+        )
+        if direct_values:
+            item.calories_100g = float(evidence["calories_100g"])
+            item.protein_g_100g = float(evidence["protein_g_100g"])
+            item.fat_g_100g = float(evidence["fat_g_100g"])
+            item.carbs_g_100g = float(evidence["carbs_g_100g"])
+
+        provider = str(evidence.get("source") or evidence.get("provider") or "external source")
+        url = str(evidence.get("url") or "").strip()
+        item.source = f"{provider} — {url}" if url else provider
+
+        match_score = float(evidence.get("match_score") or 0.5)
+        item.confidence = min(item.confidence, max(0.35, match_score))
+        accepted.append(item)
+        seen_ids.add(item.component_id)
+
+    return NutritionReferenceBatch(items=accepted)
+
+
+async def _lookup_photo_nutrition(detection: PhotoFoodDetection) -> NutritionReferenceBatch:
+    cached_refs: list[NutritionReference] = []
+    unresolved: list[PhotoFoodComponent] = []
+    cache_keys: dict[str, str] = {}
+
+    for component in detection.components:
+        cache_key = nutrition_lookup_key(
+            component.name,
+            component.brand,
+            component.preparation,
+        )
+        cache_keys[component.component_id] = cache_key
+        cached = await load_cached_nutrition(cache_key)
+        if cached is None:
+            unresolved.append(component)
+            continue
+        try:
+            ref = NutritionReference.model_validate(
+                {
+                    **cached,
+                    "component_id": component.component_id,
+                    "name": component.name,
+                }
+            )
+        except Exception:
+            unresolved.append(component)
+            continue
+        cached_refs.append(ref)
+
+    evidence_by_component: dict[str, list[dict]] = {}
+    if unresolved:
+        evidence_groups = await asyncio.gather(
+            *[
+                collect_nutrition_evidence(
+                    component.name,
+                    component.brand,
+                    component.preparation,
+                )
+                for component in unresolved
+            ]
+        )
+        evidence_by_component = {
+            component.component_id: evidence
+            for component, evidence in zip(unresolved, evidence_groups)
+        }
+
+    selected = await _select_nutrition_from_evidence(unresolved, evidence_by_component)
+    selected_by_id = {item.component_id: item for item in selected.items}
+
+    still_missing = [
+        component
+        for component in unresolved
+        if component.component_id not in selected_by_id
+    ]
+
+    google_refs: list[NutritionReference] = []
+    if still_missing:
+        # Final fallback: Gemini's native Google Search. This remains strict
+        # search-or-fail and is only used after the structured databases/web API.
+        fallback_detection = PhotoFoodDetection(
+            title=detection.title,
+            components=still_missing,
+            confidence=detection.confidence,
+            notes=detection.notes,
+        )
+        google_batch = await _lookup_photo_nutrition_google(fallback_detection)
+        google_refs = google_batch.items
+
+    all_refs = cached_refs + selected.items + google_refs
+    refs_by_id = {item.component_id: item for item in all_refs}
+    expected_ids = {item.component_id for item in detection.components}
+
+    if set(refs_by_id) != expected_ids:
+        missing = sorted(expected_ids - set(refs_by_id))
+        raise NutritionSearchUnavailable(
+            f"Nutrition sources did not resolve all components: {missing}"
+        )
+
+    for component in detection.components:
+        ref = refs_by_id[component.component_id]
+        if component.component_id not in {item.component_id for item in cached_refs}:
+            payload = ref.model_dump()
+            payload.pop("component_id", None)
+            payload["name"] = component.name
+            try:
+                await save_cached_nutrition(
+                    cache_keys[component.component_id],
+                    " ".join(
+                        part
+                        for part in [component.brand, component.name, component.preparation]
+                        if part
+                    ),
+                    payload,
+                    ref.source,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to persist nutrition cache for %s",
+                    component.component_id,
+                    exc_info=True,
+                )
+
+    return NutritionReferenceBatch(
+        items=[refs_by_id[component.component_id] for component in detection.components]
+    )
+
 def _compose_photo_food_analysis(
     detection: PhotoFoodDetection,
     nutrition: NutritionReferenceBatch,
@@ -578,9 +781,9 @@ def _compose_photo_food_analysis(
     if detection.notes:
         notes.append(detection.notes)
     if assumed_total_grams is None:
-        notes.append("КБЖУ подтверждены реальным Google Search; вес порции по фото пока приблизительный.")
+        notes.append("КБЖУ сверены по внешним базам/веб-источникам; вес порции по фото пока приблизительный.")
     else:
-        notes.append("КБЖУ подтверждены реальным Google Search и пересчитаны на указанный общий вес.")
+        notes.append("КБЖУ сверены по внешним базам/веб-источникам и пересчитаны на указанный общий вес.")
     if unresolved:
         notes.append("Не удалось надёжно подобрать пищевую ценность для: " + ", ".join(unresolved) + ".")
 
