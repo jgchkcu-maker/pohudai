@@ -10,6 +10,7 @@ from app.bot import router
 from app.config import settings
 from app.db import init_db
 from app.scheduler import build_scheduler
+from app.subscription import SubscriptionMiddleware
 
 
 async def main() -> None:
@@ -17,6 +18,11 @@ async def main() -> None:
     await init_db()
     bot = Bot(settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
+
+    subscription_middleware = SubscriptionMiddleware()
+    dp.message.outer_middleware(subscription_middleware)
+    dp.callback_query.outer_middleware(subscription_middleware)
+
     dp.include_router(router)
     scheduler = build_scheduler(bot)
     scheduler.start()
